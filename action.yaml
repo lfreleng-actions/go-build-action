@@ -1,53 +1,491 @@
 ---
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
 
-# actions-template
-name: "🛠️ Actions Template"
-description: "Description of action"
-# Any relevant notes/observations can go here
+# go-build-action
+name: "🛠️ Go Build"
+description: "Builds Go projects with optional cross-compilation"
+# Wraps actions/setup-go and go build behind a validated interface.
+# Without output_name the action performs a validation build of
+# build_target and emits no binary_path output (go build may still
+# write a binary for a single main package); with output_name it
+# builds a single main package to a named binary, supporting
+# cross-platform release matrices through the goos/goarch inputs.
 
 inputs:
-  input:
-    description: "Description of input"
-    required: true
+  # Optional
+  go_version:
+    # yamllint disable-line rule:line-length
+    description: "Explicit Go version to install; takes precedence over go_version_file"
+    required: false
+    default: ""
+  go_version_file:
+    # yamllint disable-line rule:line-length
+    description: "File to read the Go version from, relative to path_prefix; must resolve within it"
+    required: false
+    default: "go.mod"
+  path_prefix:
+    description: "Project directory; must resolve within the workspace"
+    required: false
+    default: "."
+  build_flags:
+    # yamllint disable-line rule:line-length
+    description: "Extra go build flags; allowed characters: A-Z a-z 0-9 space . _ / = , : @ + -"
+    required: false
+    default: ""
+  goos:
+    # yamllint disable-line rule:line-length
+    description: "Target operating system (GOOS); requires goarch; empty builds for the runner platform"
+    required: false
+    default: ""
+  goarch:
+    # yamllint disable-line rule:line-length
+    description: "Target architecture (GOARCH); requires goos; empty builds for the runner platform"
+    required: false
+    default: ""
+  cgo_enabled:
+    description: "CGO_ENABLED value for the build: '0' or '1'"
+    required: false
+    default: "0"
+  ldflags:
+    # yamllint disable-line rule:line-length
+    description: "Linker flags passed via -ldflags; allowed characters: A-Z a-z 0-9 space . _ / = , : @ + -"
+    required: false
+    default: ""
+  output_name:
+    # yamllint disable-line rule:line-length
+    description: "Binary filename to build; requires a build_target naming one main package; allowed characters: A-Z a-z 0-9 . _ -"
+    required: false
+    default: ""
+  build_target:
+    # yamllint disable-line rule:line-length
+    description: "Space-separated package pattern(s) to build; tokens must not start with '-'; allowed characters: A-Z a-z 0-9 space . _ / -"
+    required: false
+    default: "./..."
+  artifact_upload:
+    description: "Upload the built binary as an artifact; requires output_name"
+    required: false
+    default: "false"
+  artifact_name:
+    description: "Artifact name; allowed characters: A-Z a-z 0-9 . _ -"
+    required: false
+    default: "go-binary"
 
 outputs:
-  output:
-    description: "Description of output"
-    value: ${{ steps.code.outputs.output }}
+  binary_path:
+    description: "Absolute path to the built binary (when output_name set)"
+    value: ${{ steps.build.outputs.binary_path }}
+  go_version_used:
+    description: "Go toolchain version the build used"
+    value: ${{ steps.build.outputs.go_version_used }}
 
 runs:
   using: "composite"
   steps:
-    - name: "Friendly Name"
-      id: code
+    - name: "Validate inputs"
+      id: validate
       shell: bash
       env:
-        INPUT_VALUE: ${{ inputs.input }}
+        INPUT_GO_VERSION: ${{ inputs.go_version }}
+        INPUT_GO_VERSION_FILE: ${{ inputs.go_version_file }}
+        INPUT_PATH_PREFIX: ${{ inputs.path_prefix }}
+        INPUT_BUILD_FLAGS: ${{ inputs.build_flags }}
+        INPUT_GOOS: ${{ inputs.goos }}
+        INPUT_GOARCH: ${{ inputs.goarch }}
+        INPUT_CGO_ENABLED: ${{ inputs.cgo_enabled }}
+        INPUT_LDFLAGS: ${{ inputs.ldflags }}
+        INPUT_OUTPUT_NAME: ${{ inputs.output_name }}
+        INPUT_BUILD_TARGET: ${{ inputs.build_target }}
+        INPUT_ARTIFACT_UPLOAD: ${{ inputs.artifact_upload }}
+        INPUT_ARTIFACT_NAME: ${{ inputs.artifact_name }}
       run: |
-        # Friendly Name
-        input="$INPUT_VALUE"
-        if [ -z "$input" ]; then
-          echo "Error: mandatory input was not set/configured ❌"
+        # Validate inputs
+        # Preflight: fail with a clear message when required tools are
+        # missing (possible on minimal self-hosted runners)
+        if ! command -v realpath > /dev/null 2>&1; then
+          echo "Error: required tool not found: realpath ❌"
+          echo "This action requires realpath (GNU coreutils)"
+          echo "on the runner"
           exit 1
         fi
-
-        # Write the output using the multiline heredoc format with a random
-        # delimiter so that an input containing newlines cannot inject
-        # additional keys into $GITHUB_OUTPUT (output-file injection). The
-        # delimiter is built from shell-builtin randomness (no external
-        # tools such as openssl/uuidgen, which are not guaranteed on
-        # self-hosted runners) and regenerated until it is provably absent
-        # from the value being emitted.
-        delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
-        while [[ "$input" == *"$delimiter"* ]]; do
-          delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+        # Probe for GNU coreutils realpath: BSD/macOS realpath lacks
+        # the -m option, and later path resolution expects GNU
+        # behaviour; failing here gives a clearer error than a
+        # misleading mid-run resolution failure
+        if ! realpath -m -- / > /dev/null 2>&1; then
+          echo "Error: realpath does not support the -m option ❌"
+          echo "This action requires GNU coreutils realpath"
+          exit 1
+        fi
+        # The workspace boundary checks depend on this runner
+        # environment variable: an empty value would degrade the
+        # case patterns to /* and disable the escape checks
+        if [ -z "${GITHUB_WORKSPACE:-}" ] || \
+          [ ! -d "${GITHUB_WORKSPACE}" ]; then
+          echo "Error: GITHUB_WORKSPACE not set to a directory ❌"
+          echo "This action requires a standard runner environment"
+          exit 1
+        fi
+        case "${INPUT_ARTIFACT_UPLOAD}" in
+          true|false) ;;
+          *)
+            echo "Error: artifact_upload must be 'true' or 'false' ❌"
+            exit 1 ;;
+        esac
+        case "${INPUT_CGO_ENABLED}" in
+          0|1) ;;
+          *)
+            echo "Error: cgo_enabled must be '0' or '1' ❌"
+            exit 1 ;;
+        esac
+        # A case glob validates the entire string, including embedded
+        # newlines; grep would only validate per line
+        if [ -n "${INPUT_GO_VERSION}" ]; then
+          case "${INPUT_GO_VERSION}" in
+            *[!0-9A-Za-z.-]*)
+              echo "Error: invalid go_version ❌"
+              echo "Allowed characters: A-Z a-z 0-9 . -"
+              exit 1 ;;
+          esac
+        fi
+        # Restrict flag inputs to a safe character set so they cannot
+        # inject shell metacharacters (backticks, command substitution,
+        # semicolons, pipes, newlines) into the build command
+        if [ -n "${INPUT_BUILD_FLAGS}" ]; then
+          case "${INPUT_BUILD_FLAGS}" in
+            *[!A-Za-z0-9\ ._/=,:@+-]*)
+              echo "Error: invalid build_flags ❌"
+              echo "Allowed: A-Z a-z 0-9 space . _ / = , : @ + -"
+              exit 1 ;;
+          esac
+        fi
+        if [ -n "${INPUT_LDFLAGS}" ]; then
+          case "${INPUT_LDFLAGS}" in
+            *[!A-Za-z0-9\ ._/=,:@+-]*)
+              echo "Error: invalid ldflags ❌"
+              echo "Allowed: A-Z a-z 0-9 space . _ / = , : @ + -"
+              exit 1 ;;
+          esac
+        fi
+        # Restrict the binary name to a safe character set so it
+        # cannot alter paths or inject into downstream commands
+        if [ -n "${INPUT_OUTPUT_NAME}" ]; then
+          case "${INPUT_OUTPUT_NAME}" in
+            *[!A-Za-z0-9._-]*|.|..)
+              echo "Error: invalid output_name ❌"
+              echo "Allowed characters: A-Z a-z 0-9 . _ -"
+              echo "The values '.' and '..' are not permitted"
+              exit 1 ;;
+          esac
+        fi
+        case "${INPUT_ARTIFACT_NAME}" in
+          *[!A-Za-z0-9._-]*|'')
+            echo "Error: invalid artifact_name ❌"
+            echo "Allowed characters: A-Z a-z 0-9 . _ -"
+            exit 1 ;;
+        esac
+        if [ "${INPUT_ARTIFACT_UPLOAD}" = "true" ] && \
+          [ -z "${INPUT_OUTPUT_NAME}" ]; then
+          echo "Error: artifact_upload requires output_name ❌"
+          echo "Set output_name to build an uploadable binary"
+          exit 1
+        fi
+        # Cross-compilation targets validate against a known-good
+        # allowlist of GOOS/GOARCH pairs; both inputs set together
+        if [ -n "${INPUT_GOOS}" ] || [ -n "${INPUT_GOARCH}" ]; then
+          if [ -z "${INPUT_GOOS}" ] || [ -z "${INPUT_GOARCH}" ]; then
+            echo "Error: set goos and goarch together ❌"
+            exit 1
+          fi
+          case "${INPUT_GOOS}/${INPUT_GOARCH}" in
+            linux/amd64|linux/arm64|linux/arm|linux/386) ;;
+            linux/ppc64le|linux/s390x|linux/riscv64) ;;
+            darwin/amd64|darwin/arm64) ;;
+            windows/amd64|windows/arm64|windows/386) ;;
+            freebsd/amd64|freebsd/arm64) ;;
+            *)
+              echo "Error: unsupported goos/goarch pair ❌"
+              echo "See the action README for the supported list"
+              exit 1 ;;
+          esac
+        fi
+        # Package patterns must not smuggle extra flags into go build
+        case "${INPUT_BUILD_TARGET}" in
+          *[!A-Za-z0-9\ ._/-]*|'')
+            echo "Error: invalid build_target ❌"
+            echo "Allowed characters: A-Z a-z 0-9 space . _ / -"
+            exit 1 ;;
+        esac
+        # Reject whitespace-only values: they read as an empty
+        # pattern array and go build would silently build the
+        # current directory instead of the documented target
+        case "${INPUT_BUILD_TARGET}" in
+          *[!\ ]*) ;;
+          *)
+            echo "Error: invalid build_target ❌"
+            echo "Provide one or more package patterns"
+            exit 1 ;;
+        esac
+        read -r -a build_targets <<< "${INPUT_BUILD_TARGET}"
+        for target in "${build_targets[@]}"; do
+          case "${target}" in
+            -*)
+              echo "Error: invalid build_target ❌"
+              echo "Package patterns must not start with '-'"
+              exit 1 ;;
+          esac
         done
+        # Anchor relative paths to GITHUB_WORKSPACE: composite
+        # actions can run with a caller-set working directory, so
+        # resolving against the current directory would be
+        # non-deterministic
+        case "${INPUT_PATH_PREFIX}" in
+          /*) project_dir="${INPUT_PATH_PREFIX}" ;;
+          *) project_dir="${GITHUB_WORKSPACE}/${INPUT_PATH_PREFIX}" ;;
+        esac
+        if [ ! -d "${project_dir}" ]; then
+          echo "Error: invalid project directory ❌"
+          # Strip CR/LF before logging the untrusted path: embedded
+          # newlines could otherwise inject workflow commands via the
+          # log stream. Parameter expansion avoids an external tr
+          # dependency absent from the preflight tool list
+          sanitized="${project_dir//[$'\r\n']/}"
+          printf 'Path not found: %s\n' "${sanitized}"
+          exit 1
+        fi
+        # Restrict the build to the workspace: an absolute or escaped
+        # path could otherwise read or write arbitrary runner
+        # filesystem locations. Each realpath call fails closed: an
+        # empty result would degrade the boundary case patterns to /*
+        # and disable the escape checks
+        if ! resolved="$(realpath -- "${project_dir}")" ||
+          [ -z "${resolved}" ]; then
+          echo "Error: failed to resolve project directory ❌"
+          exit 1
+        fi
+        if ! workspace="$(realpath -- "${GITHUB_WORKSPACE}")" ||
+          [ -z "${workspace}" ]; then
+          echo "Error: failed to resolve GITHUB_WORKSPACE ❌"
+          exit 1
+        fi
+        case "${resolved}/" in
+          "${workspace}/"*) ;;
+          *)
+            echo "Error: project directory escapes the workspace ❌"
+            echo "path_prefix must resolve within GITHUB_WORKSPACE"
+            exit 1 ;;
+        esac
+        # Emit either an explicit version or a version file path for
+        # actions/setup-go; the file path can contain characters that
+        # are unsafe for plain key=value output writes, so it uses the
+        # multiline heredoc format with a random delimiter
+        # (regenerated until provably absent from the value) to
+        # prevent output-file injection
+        emit_output() {
+          key="$1"
+          value="$2"
+          delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+          while [ "${value#*"${delimiter}"}" != "${value}" ]; do
+            delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+          done
+          {
+            printf '%s<<%s\n' "${key}" "${delimiter}"
+            printf '%s\n' "${value}"
+            printf '%s\n' "${delimiter}"
+          } >> "$GITHUB_OUTPUT"
+        }
+        if [ -n "${INPUT_GO_VERSION}" ]; then
+          echo "setup_go_version=${INPUT_GO_VERSION}" >> "$GITHUB_OUTPUT"
+        else
+          case "${INPUT_GO_VERSION_FILE}" in
+            *[!A-Za-z0-9._/-]*|''|/*)
+              echo "Error: invalid go_version_file ❌"
+              echo "Expected a relative path"
+              echo "Allowed characters: A-Z a-z 0-9 . _ / -"
+              exit 1 ;;
+          esac
+          version_file="${resolved}/${INPUT_GO_VERSION_FILE}"
+          # Canonicalize before any existence probe so traversal
+          # sequences cannot test for files outside the project
+          # directory, then re-check after resolving symlinks to
+          # block symlink escapes. Check against the resolved
+          # project directory, not the workspace: go_version_file
+          # is documented as relative to path_prefix, so values
+          # such as ../go.mod must not select a version file from
+          # outside the project directory
+          if ! vf_candidate="$(realpath -m -- "${version_file}")" ||
+            [ -z "${vf_candidate}" ]; then
+            echo "Error: failed to resolve go_version_file ❌"
+            exit 1
+          fi
+          case "${vf_candidate}/" in
+            "${resolved}/"*) ;;
+            *)
+              echo "Error: go_version_file escapes the project ❌"
+              echo "go_version_file must resolve within path_prefix"
+              exit 1 ;;
+          esac
+          if [ ! -f "${vf_candidate}" ]; then
+            echo "Error: go_version_file not found ❌"
+            # Parameter expansion strips CR/LF without an external
+            # tr dependency absent from the preflight tool list
+            sanitized="${vf_candidate//[$'\r\n']/}"
+            printf 'Path not found: %s\n' "${sanitized}"
+            exit 1
+          fi
+          if ! vf_resolved="$(realpath -- "${vf_candidate}")" ||
+            [ -z "${vf_resolved}" ]; then
+            echo "Error: failed to resolve go_version_file ❌"
+            exit 1
+          fi
+          case "${vf_resolved}/" in
+            "${resolved}/"*) ;;
+            *)
+              echo "Error: go_version_file escapes the project ❌"
+              echo "go_version_file must resolve within path_prefix"
+              exit 1 ;;
+          esac
+          emit_output "setup_go_version_file" "${vf_resolved}"
+        fi
+
+    - name: "Setup Go"
+      # yamllint disable-line rule:line-length
+      uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+      with:
+        go-version: ${{ steps.validate.outputs.setup_go_version }}
+        go-version-file: ${{ steps.validate.outputs.setup_go_version_file }}
+        # Org security stance: no dependency/toolchain caching
+        cache: false
+
+    - name: "Build project"
+      id: build
+      shell: bash
+      env:
+        PROJECT_DIR: ${{ inputs.path_prefix }}
+        BUILD_FLAGS: ${{ inputs.build_flags }}
+        LDFLAGS: ${{ inputs.ldflags }}
+        OUTPUT_NAME: ${{ inputs.output_name }}
+        BUILD_TARGET: ${{ inputs.build_target }}
+        # GOOS/GOARCH/CGO_ENABLED are consumed by the go toolchain;
+        # empty GOOS/GOARCH values select the runner platform
+        GOOS: ${{ inputs.goos }}
+        GOARCH: ${{ inputs.goarch }}
+        CGO_ENABLED: ${{ inputs.cgo_enabled }}
+      run: |
+        # Build project
+        # Anchor relative paths to GITHUB_WORKSPACE so behaviour stays
+        # deterministic when the caller sets a working directory. The
+        # :? expansions hard-fail on unset/empty runner variables,
+        # which would otherwise weaken the boundary checks below
+        case "${PROJECT_DIR}" in
+          /*) ;;
+          *) PROJECT_DIR="${GITHUB_WORKSPACE:?}/${PROJECT_DIR}" ;;
+        esac
+        # Re-resolve and enforce the workspace boundary at the point
+        # of use: the workspace is mutable between steps, so relying
+        # solely on the earlier validate step would leave a TOCTOU
+        # gap (a validated directory swapped for an escaping symlink)
+        # Each realpath call fails closed: an empty result would
+        # degrade the boundary case pattern to /* and disable the
+        # escape check
+        if ! PROJECT_DIR="$(realpath -- "${PROJECT_DIR}")" ||
+          [ -z "${PROJECT_DIR}" ]; then
+          echo "Error: failed to resolve project directory ❌"
+          exit 1
+        fi
+        if ! boundary="$(realpath -- "${GITHUB_WORKSPACE:?}")" ||
+          [ -z "${boundary}" ]; then
+          echo "Error: failed to resolve GITHUB_WORKSPACE ❌"
+          exit 1
+        fi
+        case "${PROJECT_DIR}/" in
+          "${boundary}/"*) ;;
+          *)
+            echo "Error: project directory escapes the workspace ❌"
+            echo "path_prefix must resolve within GITHUB_WORKSPACE"
+            exit 1 ;;
+        esac
+        # The flag inputs passed validation against a strict character
+        # allowlist that excludes quoting and expansion characters, so
+        # whitespace word-splitting into an array is safe here
+        args=()
+        if [ -n "${BUILD_FLAGS}" ]; then
+          read -r -a extra_flags <<< "${BUILD_FLAGS}"
+          args+=("${extra_flags[@]}")
+        fi
+        if [ -n "${LDFLAGS}" ]; then
+          args+=(-ldflags "${LDFLAGS}")
+        fi
+        read -r -a targets <<< "${BUILD_TARGET}"
+        if ! cd "${PROJECT_DIR}"; then
+          echo "Error: cannot change to project directory ❌"
+          exit 1
+        fi
+        if [ -n "${OUTPUT_NAME}" ]; then
+          binary_path="${PROJECT_DIR}/${OUTPUT_NAME}"
+          if ! go build -o "${binary_path}" "${args[@]}" \
+            "${targets[@]}"; then
+            echo "Error: go build failed ❌"
+            exit 1
+          fi
+        else
+          if ! go build "${args[@]}" "${targets[@]}"; then
+            echo "Error: go build failed ❌"
+            exit 1
+          fi
+        fi
+        go_version_used="$(go env GOVERSION)"
+        go_version_used="${go_version_used#go}"
+        case "${go_version_used}" in
+          *[!0-9A-Za-z.-]*|'')
+            echo "Error: unexpected toolchain version string ❌"
+            exit 1 ;;
+        esac
+        echo "go_version_used=${go_version_used}" >> "$GITHUB_OUTPUT"
+        # The binary path derives from the caller-controlled
+        # path_prefix and can legally contain characters unsafe for
+        # plain key=value output writes, so it uses the multiline
+        # heredoc output format with a random delimiter (built from
+        # shell-builtin randomness, regenerated until provably absent
+        # from the value) to prevent output-file injection
+        emit_output() {
+          key="$1"
+          value="$2"
+          delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+          while [ "${value#*"${delimiter}"}" != "${value}" ]; do
+            delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+          done
+          {
+            printf '%s<<%s\n' "${key}" "${delimiter}"
+            printf '%s\n' "${value}"
+            printf '%s\n' "${delimiter}"
+          } >> "$GITHUB_OUTPUT"
+        }
+        if [ -n "${OUTPUT_NAME}" ]; then
+          emit_output "binary_path" "${binary_path}"
+        fi
+        echo "Go build completed ✅"
         {
-          printf '%s<<%s\n' 'output' "$delimiter"
-          printf '%s\n' "$input"
-          printf '%s\n' "$delimiter"
-        } >> "$GITHUB_OUTPUT"
-        echo "Action received: $input ✅"
-        echo "Action received: $input ✅" >> "$GITHUB_STEP_SUMMARY"
+          echo "## 🛠️ Go Build Results"
+          echo ""
+          echo "**Go Version:** ${go_version_used}"
+          echo "**Target:** ${BUILD_TARGET}"
+          if [ -n "${GOOS}" ]; then
+            echo "**Platform:** ${GOOS}/${GOARCH}"
+          else
+            echo "**Platform:** native"
+          fi
+          echo "**CGO Enabled:** ${CGO_ENABLED}"
+          if [ -n "${OUTPUT_NAME}" ]; then
+            echo "**Binary:** ${OUTPUT_NAME}"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: "Upload binary artifact"
+      if: inputs.artifact_upload == 'true'
+      # yamllint disable-line rule:line-length
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: ${{ inputs.artifact_name }}
+        path: ${{ steps.build.outputs.binary_path }}
+        if-no-files-found: error
