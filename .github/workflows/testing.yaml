@@ -45,11 +45,6 @@ jobs:
           allowed-endpoints: >
             ${{ env.CONNECTION_ALLOW_LIST }}
 
-      - name: "Checkout repository"
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
       - name: "Checkout test project: lfreleng-actions/test-go-project"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -128,13 +123,13 @@ jobs:
 
       - name: "Running local action: validation build"
         id: default-build
-        uses: ./
+        uses: $/
         with:
           path_prefix: test-project
 
       - name: "Running local action: named binary build"
         id: binary-build
-        uses: ./
+        uses: $/
         with:
           path_prefix: test-project
           build_target: '.'
@@ -144,7 +139,7 @@ jobs:
 
       - name: "Running local action: cross-compiled build"
         id: cross-build
-        uses: ./
+        uses: $/
         with:
           path_prefix: test-project
           go_version: '1.25.11'
@@ -155,7 +150,7 @@ jobs:
 
       - name: "Running local action: artifact upload"
         id: artifact-build
-        uses: ./
+        uses: $/
         with:
           path_prefix: test-project
           build_target: '.'
@@ -233,11 +228,6 @@ jobs:
           allowed-endpoints: >
             ${{ env.CONNECTION_ALLOW_LIST }}
 
-      - name: "Checkout repository"
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
       - name: "Checkout test project: onap/multicloud-k8s"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -251,7 +241,7 @@ jobs:
       # explicit modern Go version
       - name: "Running local action: nested module binary"
         id: module-build
-        uses: ./
+        uses: $/
         with:
           path_prefix: test-project/src/k8splugin
           go_version: '1.25.11'
@@ -260,7 +250,7 @@ jobs:
 
       - name: "Running local action: nested module validation build"
         id: library-build
-        uses: ./
+        uses: $/
         with:
           path_prefix: test-project/src/k8splugin
           go_version: '1.25.11'
@@ -322,29 +312,24 @@ jobs:
           allowed-endpoints: >
             ${{ env.CONNECTION_ALLOW_LIST }}
 
-      - name: "Checkout repository"
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
       - name: "Running local action with shell metacharacter flags"
         id: bad-flags
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           build_flags: '-x; id'
 
       - name: "Running local action with command substitution ldflags"
         id: bad-ldflags
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           ldflags: '-X main.version=$(id)'
 
       - name: "Running local action with unsupported goos/goarch"
         id: bad-platform
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           goos: solaris
           goarch: amd64
@@ -352,49 +337,49 @@ jobs:
       - name: "Running local action with goos but no goarch"
         id: half-platform
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           goos: linux
 
       - name: "Running local action with invalid cgo_enabled"
         id: bad-cgo
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           cgo_enabled: '2'
 
       - name: "Running local action with workspace-escaping path"
         id: escape-path
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           path_prefix: /etc
 
       - name: "Running local action with unsafe output name"
         id: bad-output
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           output_name: '../escape'
 
       - name: "Running local action with invalid boolean"
         id: bad-bool
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           artifact_upload: 'yes'
 
       - name: "Running local action with upload but no output name"
         id: upload-no-output
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           artifact_upload: 'true'
 
       - name: "Running local action with flag-like build target"
         id: bad-target
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           build_target: '-x'
 
