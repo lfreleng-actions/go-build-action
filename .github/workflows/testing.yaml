@@ -22,8 +22,12 @@ permissions: {}
 jobs:
   ### Test builds against the synthetic Go fixture ###
   test-synthetic:
-    name: "Test: synthetic fixture (test-go-project)"
-    runs-on: ubuntu-latest
+    name: "Test: synthetic fixture (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     permissions:
       contents: read
     timeout-minutes: 15
@@ -31,13 +35,16 @@ jobs:
       # Load the egress allow-list out-of-band from the
       # organisation's .github repository and publish it as
       # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # Egress blocking supports Linux runners only.
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
+        if: runner.os == 'Linux'
         with:
           config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d' # v0.19.0
 
       # Harden the runner with the just-loaded allow-list.
       - name: "Harden runner (block)"
+        if: runner.os == 'Linux'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
@@ -133,7 +140,8 @@ jobs:
         with:
           path_prefix: test-project
           build_target: '.'
-          output_name: calculator
+          # yamllint disable-line rule:line-length
+          output_name: "calculator${{ runner.os == 'Windows' && '.exe' || '' }}"
           build_flags: '-trimpath'
           ldflags: '-s -w'
 
@@ -156,7 +164,7 @@ jobs:
           build_target: '.'
           output_name: calculator-artifact
           artifact_upload: 'true'
-          artifact_name: go-build-test-binary
+          artifact_name: "go-build-test-binary-${{ matrix.os }}"
 
       - name: "Verify build outputs"
         shell: bash
@@ -289,8 +297,12 @@ jobs:
 
   ### Test invalid inputs fail closed ###
   test-failures:
-    name: "Test: invalid inputs and error handling"
-    runs-on: ubuntu-latest
+    name: "Test: invalid inputs (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     permissions:
       contents: read
     timeout-minutes: 10
@@ -298,19 +310,46 @@ jobs:
       # Load the egress allow-list out-of-band from the
       # organisation's .github repository and publish it as
       # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # Egress blocking supports Linux runners only.
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
+        if: runner.os == 'Linux'
         with:
           config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d' # v0.19.0
 
       # Harden the runner with the just-loaded allow-list.
       - name: "Harden runner (block)"
+        if: runner.os == 'Linux'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
             ${{ env.CONNECTION_ALLOW_LIST }}
+
+      # Stage symlinks that escape the workspace. Git Bash on Windows
+      # copies files for ln -s unless asked for native symlinks; the
+      # -L checks stop a copy from passing these cases vacuously
+      - name: "Create workspace-escape fixtures"
+        shell: bash
+        env:
+          MSYS: winsymlinks:nativestrict
+        run: |
+          # Create workspace-escape fixtures
+          outside="$(cd "${RUNNER_TEMP}" && pwd -P)/outside"
+          mkdir -p "${outside}/deep" escape-project
+          printf 'module outside\n\ngo 1.25\n' > "${outside}/go.mod"
+          printf 'module inside\n\ngo 1.25\n' > escape-project/go.mod
+          ln -s "${outside}" escape-link
+          ln -s "${outside}/go.mod" escape-project/outside.mod
+          ln -s "${outside}/deep" escape-project/deep-link
+          if [ ! -L escape-link ] || [ ! -L escape-project/outside.mod ] ||
+            [ ! -L escape-project/deep-link ]
+          then
+            echo "Error: failed to create symlink fixtures ❌"
+            exit 1
+          fi
+          echo "Escape fixtures created ✅"
 
       - name: "Running local action with shell metacharacter flags"
         id: bad-flags
@@ -355,6 +394,46 @@ jobs:
         with:
           path_prefix: /etc
 
+      - name: "Running local action with dot-dot escaping path"
+        id: escape-dotdot
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: '..'
+
+      - name: "Running local action with symlink escaping path"
+        id: escape-symlink
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: escape-link
+
+      - name: "Running local action with dot-dot version file"
+        id: escape-vf-dotdot
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: escape-project
+          go_version_file: '../escape-link/go.mod'
+
+      - name: "Running local action with symlink version file"
+        id: escape-vf-symlink
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: escape-project
+          go_version_file: outside.mod
+
+      # A symlink reached after .. climbs back out of a missing
+      # component must still resolve: deep-link/.. is outside/
+      - name: "Running local action with symlink after missing dir"
+        id: escape-vf-missing
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: escape-project
+          go_version_file: 'missing/../deep-link/../go.mod'
+
       - name: "Running local action with unsafe output name"
         id: bad-output
         continue-on-error: true
@@ -392,6 +471,11 @@ jobs:
           HALF_PLATFORM_OUTCOME: ${{ steps.half-platform.outcome }}
           CGO_OUTCOME: ${{ steps.bad-cgo.outcome }}
           ESCAPE_OUTCOME: ${{ steps.escape-path.outcome }}
+          DOTDOT_OUTCOME: ${{ steps.escape-dotdot.outcome }}
+          SYMLINK_OUTCOME: ${{ steps.escape-symlink.outcome }}
+          VF_DOTDOT_OUTCOME: ${{ steps.escape-vf-dotdot.outcome }}
+          VF_SYMLINK_OUTCOME: ${{ steps.escape-vf-symlink.outcome }}
+          VF_MISSING_OUTCOME: ${{ steps.escape-vf-missing.outcome }}
           OUTPUT_OUTCOME: ${{ steps.bad-output.outcome }}
           BOOL_OUTCOME: ${{ steps.bad-bool.outcome }}
           UPLOAD_OUTCOME: ${{ steps.upload-no-output.outcome }}
@@ -406,6 +490,11 @@ jobs:
             "half-platform:${HALF_PLATFORM_OUTCOME}" \
             "cgo:${CGO_OUTCOME}" \
             "escape:${ESCAPE_OUTCOME}" \
+            "escape-dotdot:${DOTDOT_OUTCOME}" \
+            "escape-symlink:${SYMLINK_OUTCOME}" \
+            "escape-vf-dotdot:${VF_DOTDOT_OUTCOME}" \
+            "escape-vf-symlink:${VF_SYMLINK_OUTCOME}" \
+            "escape-vf-missing:${VF_MISSING_OUTCOME}" \
             "output:${OUTPUT_OUTCOME}" \
             "bool:${BOOL_OUTCOME}" \
             "upload:${UPLOAD_OUTCOME}" \

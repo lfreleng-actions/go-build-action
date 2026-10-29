@@ -100,23 +100,106 @@ runs:
         INPUT_ARTIFACT_NAME: ${{ inputs.artifact_name }}
       run: |
         # Validate inputs
-        # Preflight: fail with a clear message when required tools are
-        # missing (possible on minimal self-hosted runners)
-        if ! command -v realpath > /dev/null 2>&1; then
-          echo "Error: required tool not found: realpath ❌"
-          echo "This action requires realpath (GNU coreutils)"
-          echo "on the runner"
+        # Probe for GNU coreutils realpath: it supports -m, while the
+        # BSD realpath on macOS does not. Without it the pure-bash
+        # fallback in resolve_path needs readlink to follow symlinks
+        gnu_realpath=false
+        if command -v realpath > /dev/null 2>&1 &&
+          realpath -m -- / > /dev/null 2>&1; then
+          gnu_realpath=true
+        elif ! command -v readlink > /dev/null 2>&1; then
+          echo "Error: required tool not found: readlink ❌"
+          echo "This action requires GNU realpath or readlink"
           exit 1
         fi
-        # Probe for GNU coreutils realpath: BSD/macOS realpath lacks
-        # the -m option, and later path resolution expects GNU
-        # behaviour; failing here gives a clearer error than a
-        # misleading mid-run resolution failure
-        if ! realpath -m -- / > /dev/null 2>&1; then
-          echo "Error: realpath does not support the -m option ❌"
-          echo "This action requires GNU coreutils realpath"
-          exit 1
-        fi
+        # Resolve a path to its canonical absolute form. GNU realpath
+        # serves where it supports -m (Linux, Git Bash on Windows);
+        # elsewhere (macOS's BSD realpath lacks -m) a bash 3.2
+        # compatible fallback walks the path one component at a time,
+        # following symlinks via readlink. With -m, components need
+        # not exist; without it, every component must exist. Returns
+        # non-zero on failure
+        resolve_path() {
+          local missing_ok=false rest out part next target
+          local links=0
+          if [ "$1" = "-m" ]; then
+            missing_ok=true
+            shift
+          fi
+          if [ "${gnu_realpath}" = "true" ]; then
+            if [ "${missing_ok}" = "true" ]; then
+              realpath -m -- "$1"
+            else
+              realpath -- "$1"
+            fi
+            return
+          fi
+          rest="$1"
+          [ -n "${rest}" ] || return 1
+          case "${rest}" in
+            /*) ;;
+            *) rest="${PWD}/${rest}" ;;
+          esac
+          out=""
+          while [ -n "${rest}" ]; do
+            case "${rest}" in
+              */*)
+                part="${rest%%/*}"
+                rest="${rest#*/}" ;;
+              *)
+                part="${rest}"
+                rest="" ;;
+            esac
+            case "${part}" in
+              ''|.) continue ;;
+              ..)
+                out="${out%/*}"
+                continue ;;
+            esac
+            next="${out}/${part}"
+            if [ -L "${next}" ]; then
+              links=$((links + 1))
+              [ "${links}" -le 40 ] || return 1
+              # The sentinel preserves trailing newlines in the target
+              target="$(readlink -- "${next}" && printf x)" ||
+                return 1
+              target="${target%x}"
+              target="${target%$'\n'}"
+              [ -n "${target}" ] || return 1
+              case "${target}" in
+                /*) out="" ;;
+              esac
+              if [ -n "${rest}" ]; then
+                rest="${target}/${rest}"
+              else
+                rest="${target}"
+              fi
+              continue
+            fi
+            # Keep probing after a missing or non-directory component,
+            # as GNU realpath -m does: a later .. can climb back into
+            # an existing directory whose symlinks must still resolve
+            if [ "${missing_ok}" != "true" ]; then
+              if [ ! -e "${next}" ]; then
+                return 1
+              elif [ ! -d "${next}" ] && [ -n "${rest}" ]; then
+                return 1
+              fi
+            fi
+            out="${next}"
+          done
+          printf '%s\n' "${out:-/}"
+        }
+        # Node-based actions on Windows cannot read the POSIX-style
+        # paths Git Bash produces (/d/a/...), so convert any path
+        # handed to a later step to its native form there
+        native_path() {
+          if [ "${RUNNER_OS:-}" = "Windows" ]; then
+            cygpath -w -- "$1"
+          else
+            printf '%s\n' "$1"
+          fi
+        }
         # The workspace boundary checks depend on this runner
         # environment variable: an empty value would degrade the
         # case patterns to /* and disable the escape checks
@@ -255,15 +338,15 @@ runs:
         fi
         # Restrict the build to the workspace: an absolute or escaped
         # path could otherwise read or write arbitrary runner
-        # filesystem locations. Each realpath call fails closed: an
+        # filesystem locations. Each resolve_path call fails closed: an
         # empty result would degrade the boundary case patterns to /*
         # and disable the escape checks
-        if ! resolved="$(realpath -- "${project_dir}")" ||
+        if ! resolved="$(resolve_path "${project_dir}")" ||
           [ -z "${resolved}" ]; then
           echo "Error: failed to resolve project directory ❌"
           exit 1
         fi
-        if ! workspace="$(realpath -- "${GITHUB_WORKSPACE}")" ||
+        if ! workspace="$(resolve_path "${GITHUB_WORKSPACE}")" ||
           [ -z "${workspace}" ]; then
           echo "Error: failed to resolve GITHUB_WORKSPACE ❌"
           exit 1
@@ -313,7 +396,7 @@ runs:
           # is documented as relative to path_prefix, so values
           # such as ../go.mod must not select a version file from
           # outside the project directory
-          if ! vf_candidate="$(realpath -m -- "${version_file}")" ||
+          if ! vf_candidate="$(resolve_path -m "${version_file}")" ||
             [ -z "${vf_candidate}" ]; then
             echo "Error: failed to resolve go_version_file ❌"
             exit 1
@@ -333,7 +416,7 @@ runs:
             printf 'Path not found: %s\n' "${sanitized}"
             exit 1
           fi
-          if ! vf_resolved="$(realpath -- "${vf_candidate}")" ||
+          if ! vf_resolved="$(resolve_path "${vf_candidate}")" ||
             [ -z "${vf_resolved}" ]; then
             echo "Error: failed to resolve go_version_file ❌"
             exit 1
@@ -345,7 +428,12 @@ runs:
               echo "go_version_file must resolve within path_prefix"
               exit 1 ;;
           esac
-          emit_output "setup_go_version_file" "${vf_resolved}"
+          if ! vf_native="$(native_path "${vf_resolved}")" ||
+            [ -z "${vf_native}" ]; then
+            echo "Error: failed to convert go_version_file path ❌"
+            exit 1
+          fi
+          emit_output "setup_go_version_file" "${vf_native}"
         fi
 
     - name: "Setup Go"
@@ -381,19 +469,119 @@ runs:
           /*) ;;
           *) PROJECT_DIR="${GITHUB_WORKSPACE:?}/${PROJECT_DIR}" ;;
         esac
+        # Probe for GNU coreutils realpath: it supports -m, while the
+        # BSD realpath on macOS does not. Without it the pure-bash
+        # fallback in resolve_path needs readlink to follow symlinks
+        gnu_realpath=false
+        if command -v realpath > /dev/null 2>&1 &&
+          realpath -m -- / > /dev/null 2>&1; then
+          gnu_realpath=true
+        elif ! command -v readlink > /dev/null 2>&1; then
+          echo "Error: required tool not found: readlink ❌"
+          echo "This action requires GNU realpath or readlink"
+          exit 1
+        fi
+        # Resolve a path to its canonical absolute form. GNU realpath
+        # serves where it supports -m (Linux, Git Bash on Windows);
+        # elsewhere (macOS's BSD realpath lacks -m) a bash 3.2
+        # compatible fallback walks the path one component at a time,
+        # following symlinks via readlink. With -m, components need
+        # not exist; without it, every component must exist. Returns
+        # non-zero on failure
+        resolve_path() {
+          local missing_ok=false rest out part next target
+          local links=0
+          if [ "$1" = "-m" ]; then
+            missing_ok=true
+            shift
+          fi
+          if [ "${gnu_realpath}" = "true" ]; then
+            if [ "${missing_ok}" = "true" ]; then
+              realpath -m -- "$1"
+            else
+              realpath -- "$1"
+            fi
+            return
+          fi
+          rest="$1"
+          [ -n "${rest}" ] || return 1
+          case "${rest}" in
+            /*) ;;
+            *) rest="${PWD}/${rest}" ;;
+          esac
+          out=""
+          while [ -n "${rest}" ]; do
+            case "${rest}" in
+              */*)
+                part="${rest%%/*}"
+                rest="${rest#*/}" ;;
+              *)
+                part="${rest}"
+                rest="" ;;
+            esac
+            case "${part}" in
+              ''|.) continue ;;
+              ..)
+                out="${out%/*}"
+                continue ;;
+            esac
+            next="${out}/${part}"
+            if [ -L "${next}" ]; then
+              links=$((links + 1))
+              [ "${links}" -le 40 ] || return 1
+              # The sentinel preserves trailing newlines in the target
+              target="$(readlink -- "${next}" && printf x)" ||
+                return 1
+              target="${target%x}"
+              target="${target%$'\n'}"
+              [ -n "${target}" ] || return 1
+              case "${target}" in
+                /*) out="" ;;
+              esac
+              if [ -n "${rest}" ]; then
+                rest="${target}/${rest}"
+              else
+                rest="${target}"
+              fi
+              continue
+            fi
+            # Keep probing after a missing or non-directory component,
+            # as GNU realpath -m does: a later .. can climb back into
+            # an existing directory whose symlinks must still resolve
+            if [ "${missing_ok}" != "true" ]; then
+              if [ ! -e "${next}" ]; then
+                return 1
+              elif [ ! -d "${next}" ] && [ -n "${rest}" ]; then
+                return 1
+              fi
+            fi
+            out="${next}"
+          done
+          printf '%s\n' "${out:-/}"
+        }
+        # Node-based actions on Windows cannot read the POSIX-style
+        # paths Git Bash produces (/d/a/...), so convert any path
+        # handed to a later step to its native form there
+        native_path() {
+          if [ "${RUNNER_OS:-}" = "Windows" ]; then
+            cygpath -w -- "$1"
+          else
+            printf '%s\n' "$1"
+          fi
+        }
         # Re-resolve and enforce the workspace boundary at the point
         # of use: the workspace is mutable between steps, so relying
         # solely on the earlier validate step would leave a TOCTOU
         # gap (a validated directory swapped for an escaping symlink)
-        # Each realpath call fails closed: an empty result would
+        # Each resolve_path call fails closed: an empty result would
         # degrade the boundary case pattern to /* and disable the
         # escape check
-        if ! PROJECT_DIR="$(realpath -- "${PROJECT_DIR}")" ||
+        if ! PROJECT_DIR="$(resolve_path "${PROJECT_DIR}")" ||
           [ -z "${PROJECT_DIR}" ]; then
           echo "Error: failed to resolve project directory ❌"
           exit 1
         fi
-        if ! boundary="$(realpath -- "${GITHUB_WORKSPACE:?}")" ||
+        if ! boundary="$(resolve_path "${GITHUB_WORKSPACE:?}")" ||
           [ -z "${boundary}" ]; then
           echo "Error: failed to resolve GITHUB_WORKSPACE ❌"
           exit 1
@@ -462,7 +650,12 @@ runs:
           } >> "$GITHUB_OUTPUT"
         }
         if [ -n "${OUTPUT_NAME}" ]; then
-          emit_output "binary_path" "${binary_path}"
+          if ! binary_native="$(native_path "${binary_path}")" ||
+            [ -z "${binary_native}" ]; then
+            echo "Error: failed to convert binary path ❌"
+            exit 1
+          fi
+          emit_output "binary_path" "${binary_native}"
         fi
         echo "Go build completed ✅"
         {
