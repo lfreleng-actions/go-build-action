@@ -27,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest]
     permissions:
       contents: read
     timeout-minutes: 15
@@ -35,16 +35,16 @@ jobs:
       # Load the egress allow-list out-of-band from the
       # organisation's .github repository and publish it as
       # $CONNECTION_ALLOW_LIST for the harden-runner step below.
-      # Egress blocking supports Linux runners only.
+      # Egress blocking supports Linux runners only, so this job
+      # runs on Linux and its steps after these two are aliased
+      # by a separate macOS and Windows job.
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
-        if: runner.os == 'Linux'
         with:
           config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d' # v0.19.0
 
       # Harden the runner with the just-loaded allow-list.
       - name: "Harden runner (block)"
-        if: runner.os == 'Linux'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
@@ -52,7 +52,8 @@ jobs:
           allowed-endpoints: >
             ${{ env.CONNECTION_ALLOW_LIST }}
 
-      - name: "Checkout test project: lfreleng-actions/test-go-project"
+      - &synthetic-checkout
+        name: "Checkout test project: lfreleng-actions/test-go-project"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: lfreleng-actions/test-go-project
@@ -65,7 +66,8 @@ jobs:
       # entry). Restore a minimal implementation so build and test
       # operations succeed; drop this step once the fixture repo
       # gains the package upstream.
-      - name: "Restore missing fixture package"
+      - &synthetic-restore
+        name: "Restore missing fixture package"
         shell: bash
         run: |
           # Restore missing fixture package
@@ -128,13 +130,15 @@ jobs:
           EOF
           echo "Fixture package restored ✅"
 
-      - name: "Running local action: validation build"
+      - &synthetic-default-build
+        name: "Running local action: validation build"
         id: default-build
         uses: $/
         with:
           path_prefix: test-project
 
-      - name: "Running local action: named binary build"
+      - &synthetic-binary-build
+        name: "Running local action: named binary build"
         id: binary-build
         uses: $/
         with:
@@ -145,7 +149,8 @@ jobs:
           build_flags: '-trimpath'
           ldflags: '-s -w'
 
-      - name: "Running local action: cross-compiled build"
+      - &synthetic-cross-build
+        name: "Running local action: cross-compiled build"
         id: cross-build
         uses: $/
         with:
@@ -156,7 +161,8 @@ jobs:
           goarch: arm64
           output_name: calculator-linux-arm64
 
-      - name: "Running local action: artifact upload"
+      - &synthetic-artifact-build
+        name: "Running local action: artifact upload"
         id: artifact-build
         uses: $/
         with:
@@ -166,7 +172,8 @@ jobs:
           artifact_upload: 'true'
           artifact_name: "go-build-test-binary-${{ matrix.os }}"
 
-      - name: "Verify build outputs"
+      - &synthetic-verify
+        name: "Verify build outputs"
         shell: bash
         env:
           DEFAULT_VERSION: >-
@@ -210,6 +217,30 @@ jobs:
           fi
           echo "Build outputs verified ✅"
           echo "Build outputs verified ✅" >> "$GITHUB_STEP_SUMMARY"
+
+  # The test-synthetic steps on macOS and Windows, without
+  # harden-runner. Its pre step runs whatever the step's 'if:'
+  # says; on Windows it points DNS at a local proxy, and a job
+  # that ends before the proxy is ready is left without DNS and
+  # hangs. The steps alias the Linux job's so they cannot drift.
+  test-synthetic-unhardened:
+    name: "Test: synthetic fixture (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - *synthetic-checkout
+      - *synthetic-restore
+      - *synthetic-default-build
+      - *synthetic-binary-build
+      - *synthetic-cross-build
+      - *synthetic-artifact-build
+      - *synthetic-verify
 
   ### Test builds against a real Gerrit-mirrored monorepo ###
   test-real:
@@ -302,7 +333,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest]
     permissions:
       contents: read
     timeout-minutes: 10
@@ -310,16 +341,16 @@ jobs:
       # Load the egress allow-list out-of-band from the
       # organisation's .github repository and publish it as
       # $CONNECTION_ALLOW_LIST for the harden-runner step below.
-      # Egress blocking supports Linux runners only.
+      # Egress blocking supports Linux runners only, so this job
+      # runs on Linux and its steps after these two are aliased
+      # by a separate macOS and Windows job.
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
-        if: runner.os == 'Linux'
         with:
           config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d' # v0.19.0
 
       # Harden the runner with the just-loaded allow-list.
       - name: "Harden runner (block)"
-        if: runner.os == 'Linux'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
@@ -330,7 +361,8 @@ jobs:
       # Stage symlinks that escape the workspace. Git Bash on Windows
       # copies files for ln -s unless asked for native symlinks; the
       # -L checks stop a copy from passing these cases vacuously
-      - name: "Create workspace-escape fixtures"
+      - &failures-fixtures
+        name: "Create workspace-escape fixtures"
         shell: bash
         env:
           MSYS: winsymlinks:nativestrict
@@ -351,21 +383,24 @@ jobs:
           fi
           echo "Escape fixtures created ✅"
 
-      - name: "Running local action with shell metacharacter flags"
+      - &failures-bad-flags
+        name: "Running local action with shell metacharacter flags"
         id: bad-flags
         continue-on-error: true
         uses: $/
         with:
           build_flags: '-x; id'
 
-      - name: "Running local action with command substitution ldflags"
+      - &failures-bad-ldflags
+        name: "Running local action with command substitution ldflags"
         id: bad-ldflags
         continue-on-error: true
         uses: $/
         with:
           ldflags: '-X main.version=$(id)'
 
-      - name: "Running local action with unsupported goos/goarch"
+      - &failures-bad-platform
+        name: "Running local action with unsupported goos/goarch"
         id: bad-platform
         continue-on-error: true
         uses: $/
@@ -373,42 +408,48 @@ jobs:
           goos: solaris
           goarch: amd64
 
-      - name: "Running local action with goos but no goarch"
+      - &failures-half-platform
+        name: "Running local action with goos but no goarch"
         id: half-platform
         continue-on-error: true
         uses: $/
         with:
           goos: linux
 
-      - name: "Running local action with invalid cgo_enabled"
+      - &failures-bad-cgo
+        name: "Running local action with invalid cgo_enabled"
         id: bad-cgo
         continue-on-error: true
         uses: $/
         with:
           cgo_enabled: '2'
 
-      - name: "Running local action with workspace-escaping path"
+      - &failures-escape-path
+        name: "Running local action with workspace-escaping path"
         id: escape-path
         continue-on-error: true
         uses: $/
         with:
           path_prefix: /etc
 
-      - name: "Running local action with dot-dot escaping path"
+      - &failures-escape-dotdot
+        name: "Running local action with dot-dot escaping path"
         id: escape-dotdot
         continue-on-error: true
         uses: $/
         with:
           path_prefix: '..'
 
-      - name: "Running local action with symlink escaping path"
+      - &failures-escape-symlink
+        name: "Running local action with symlink escaping path"
         id: escape-symlink
         continue-on-error: true
         uses: $/
         with:
           path_prefix: escape-link
 
-      - name: "Running local action with dot-dot version file"
+      - &failures-escape-vf-dotdot
+        name: "Running local action with dot-dot version file"
         id: escape-vf-dotdot
         continue-on-error: true
         uses: $/
@@ -416,7 +457,8 @@ jobs:
           path_prefix: escape-project
           go_version_file: '../escape-link/go.mod'
 
-      - name: "Running local action with symlink version file"
+      - &failures-escape-vf-symlink
+        name: "Running local action with symlink version file"
         id: escape-vf-symlink
         continue-on-error: true
         uses: $/
@@ -426,7 +468,8 @@ jobs:
 
       # A symlink reached after .. climbs back out of a missing
       # component must still resolve: deep-link/.. is outside/
-      - name: "Running local action with symlink after missing dir"
+      - &failures-escape-vf-missing
+        name: "Running local action with symlink after missing dir"
         id: escape-vf-missing
         continue-on-error: true
         uses: $/
@@ -434,35 +477,40 @@ jobs:
           path_prefix: escape-project
           go_version_file: 'missing/../deep-link/../go.mod'
 
-      - name: "Running local action with unsafe output name"
+      - &failures-bad-output
+        name: "Running local action with unsafe output name"
         id: bad-output
         continue-on-error: true
         uses: $/
         with:
           output_name: '../escape'
 
-      - name: "Running local action with invalid boolean"
+      - &failures-bad-bool
+        name: "Running local action with invalid boolean"
         id: bad-bool
         continue-on-error: true
         uses: $/
         with:
           artifact_upload: 'yes'
 
-      - name: "Running local action with upload but no output name"
+      - &failures-upload-no-output
+        name: "Running local action with upload but no output name"
         id: upload-no-output
         continue-on-error: true
         uses: $/
         with:
           artifact_upload: 'true'
 
-      - name: "Running local action with flag-like build target"
+      - &failures-bad-target
+        name: "Running local action with flag-like build target"
         id: bad-target
         continue-on-error: true
         uses: $/
         with:
           build_target: '-x'
 
-      - name: "Verify invalid inputs were rejected"
+      - &failures-verify
+        name: "Verify invalid inputs were rejected"
         shell: bash
         env:
           FLAGS_OUTCOME: ${{ steps.bad-flags.outcome }}
@@ -513,3 +561,37 @@ jobs:
           echo "Invalid inputs correctly rejected ✅"
           echo "Invalid inputs correctly rejected ✅" \
             >> "$GITHUB_STEP_SUMMARY"
+
+  # The test-failures steps on macOS and Windows, without
+  # harden-runner. Its pre step runs whatever the step's 'if:'
+  # says; on Windows it points DNS at a local proxy, and a job
+  # that ends before the proxy is ready is left without DNS and
+  # hangs. The steps alias the Linux job's so they cannot drift.
+  test-failures-unhardened:
+    name: "Test: invalid inputs (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - *failures-fixtures
+      - *failures-bad-flags
+      - *failures-bad-ldflags
+      - *failures-bad-platform
+      - *failures-half-platform
+      - *failures-bad-cgo
+      - *failures-escape-path
+      - *failures-escape-dotdot
+      - *failures-escape-symlink
+      - *failures-escape-vf-dotdot
+      - *failures-escape-vf-symlink
+      - *failures-escape-vf-missing
+      - *failures-bad-output
+      - *failures-bad-bool
+      - *failures-upload-no-output
+      - *failures-bad-target
+      - *failures-verify
