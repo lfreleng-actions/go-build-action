@@ -55,9 +55,12 @@ steps:
 
 ## Requirements
 
-The action needs `realpath` (GNU coreutils) on the runner.
-GitHub-hosted Ubuntu runners include it; minimal self-hosted or
-non-Linux runners must provide it. The action installs the Go
+The action runs on Linux, macOS and Windows runners and needs `bash`.
+It resolves paths with GNU `realpath` where available (Linux, Git
+Bash on Windows) and otherwise falls back to a pure-bash resolver
+that needs `readlink`, so macOS runners need no GNU coreutils. The
+action converts the paths it emits to native Windows form on Windows
+runners. The action installs the Go
 toolchain via the pinned `actions/setup-go`, with caching off per
 organisation security policy, so runners need egress to the Go
 distribution endpoints and, for module downloads during the build, to
