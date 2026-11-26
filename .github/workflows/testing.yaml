@@ -172,6 +172,27 @@ jobs:
           artifact_upload: 'true'
           artifact_name: "go-build-test-binary-${{ matrix.os }}"
 
+      # A native absolute -C path (D:/a/... on Windows) must resolve
+      # as absolute, not be prefixed with the project directory
+      - &synthetic-abs-chdir-path
+        name: "Resolve native project path for -C"
+        id: abs-chdir-path
+        shell: bash
+        run: |
+          # Resolve native project path for -C
+          dir="${GITHUB_WORKSPACE}/test-project"
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            dir="$(cygpath -m -- "${dir}")"
+          fi
+          echo "dir=${dir}" >> "$GITHUB_OUTPUT"
+
+      - &synthetic-abs-chdir-build
+        name: "Running local action: native absolute -C"
+        uses: $/
+        with:
+          path_prefix: test-project
+          build_flags: "-C ${{ steps.abs-chdir-path.outputs.dir }}"
+
       - &synthetic-verify
         name: "Verify build outputs"
         shell: bash
@@ -240,6 +261,8 @@ jobs:
       - *synthetic-binary-build
       - *synthetic-cross-build
       - *synthetic-artifact-build
+      - *synthetic-abs-chdir-path
+      - *synthetic-abs-chdir-build
       - *synthetic-verify
 
   ### Test builds against a real Gerrit-mirrored monorepo ###
@@ -325,6 +348,967 @@ jobs:
           fi
           echo "Real fixture builds verified ✅"
           echo "Real fixture builds verified ✅" >> "$GITHUB_STEP_SUMMARY"
+
+  ### Test module download retries and supported layouts ###
+  test-module-download:
+    name: "Test: module download retries"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@65ff87957e1cac2de3203a85dbb07c31810321cb  # v0.16.4
+        with:
+          config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d' # v0.19.0
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Create module download fixtures"
+        shell: bash
+        run: |
+          # Create module download fixtures
+          # A module with one dependency, so each download fetches it
+          mkdir -p dl-project
+          cat > dl-project/go.mod << 'EOF'
+          module example.com/dl
+
+          go 1.22
+
+          require github.com/google/uuid v1.6.0
+          EOF
+          printf '%s %s %s\n' \
+            github.com/google/uuid v1.6.0 \
+            h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0= \
+            github.com/google/uuid v1.6.0/go.mod \
+            h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo= \
+            > dl-project/go.sum
+          cat > dl-project/main.go << 'EOF'
+          package main
+
+          import (
+              "fmt"
+
+              "github.com/google/uuid"
+          )
+
+          func main() { fmt.Println(uuid.NewString()) }
+          EOF
+          # A module that downloads cleanly but does not compile
+          mkdir -p broken-project
+          printf 'module example.com/broken\n\ngo 1.22\n' \
+            > broken-project/go.mod
+          cat > broken-project/main.go << 'EOF'
+          package main
+
+          func main() {
+              var n int = "not an int"
+              _ = n
+          }
+          EOF
+          # A vendored module whose dependency exists nowhere else
+          mkdir -p vendor-project/vendor/example.com/greet
+          cat > vendor-project/go.mod << 'EOF'
+          module example.com/vendored
+
+          go 1.22
+
+          require example.com/greet v1.0.0
+          EOF
+          cat > vendor-project/vendor/modules.txt << 'EOF'
+          # example.com/greet v1.0.0
+          ## explicit; go 1.22
+          example.com/greet
+          EOF
+          cat > vendor-project/vendor/example.com/greet/greet.go << 'EOF'
+          package greet
+
+          func Hello() string { return "hello" }
+          EOF
+          cat > vendor-project/main.go << 'EOF'
+          package main
+
+          import (
+              "fmt"
+
+              "example.com/greet"
+          )
+
+          func main() { fmt.Println(greet.Hello()) }
+          EOF
+          # A Go workspace whose go.work sits above the project directory
+          mkdir -p work-project/app work-project/lib
+          cat > work-project/go.work << 'EOF'
+          go 1.22
+
+          use (
+              ./app
+              ./lib
+          )
+          EOF
+          printf 'module example.com/lib\n\ngo 1.22\n' \
+            > work-project/lib/go.mod
+          cat > work-project/lib/lib.go << 'EOF'
+          package lib
+
+          func Name() string { return "lib" }
+          EOF
+          cp dl-project/go.sum work-project/app/go.sum
+          cat > work-project/app/go.mod << 'EOF'
+          module example.com/app
+
+          go 1.22
+
+          require github.com/google/uuid v1.6.0
+          EOF
+          cat > work-project/app/main.go << 'EOF'
+          package main
+
+          import (
+              "fmt"
+
+              "example.com/lib"
+              "github.com/google/uuid"
+          )
+
+          func main() { fmt.Println(lib.Name(), uuid.NewString()) }
+          EOF
+          # A module whose go.mod lacks the dependency that only the
+          # alternate ci.mod, selected through -modfile, requires
+          mkdir -p modfile-project
+          printf 'module example.com/modfile\n\ngo 1.22\n' \
+            > modfile-project/go.mod
+          sed 's/example.com\/dl/example.com\/modfile/' \
+            dl-project/go.mod > modfile-project/ci.mod
+          cp dl-project/go.sum modfile-project/ci.sum
+          cp dl-project/main.go modfile-project/main.go
+          # An import missing from go.mod, which only -mod=mod resolves
+          mkdir -p missing-project
+          printf 'module example.com/missing\n\ngo 1.22\n' \
+            > missing-project/go.mod
+          cp dl-project/main.go missing-project/main.go
+          # The same, for -mod=mod given in a quoted, multiline, -json,
+          # -find, -reuse or go env -u/-w/-changed GOFLAGS, which go
+          # splits by its own quoting rules
+          for variant in quoted multiline json find reuse goenv; do
+            mkdir -p "missing-${variant}-project"
+            cp missing-project/go.mod missing-project/main.go \
+              "missing-${variant}-project/"
+          done
+          # A main package whose files declare two package names: a
+          # source error that go list -mod=mod reports, not a fetch
+          mkdir -p broken-package-project
+          printf 'module example.com/brokenpkg\n\ngo 1.22\n' \
+            > broken-package-project/go.mod
+          printf 'package main\n\nfunc main() {}\n' \
+            > broken-package-project/main.go
+          printf 'package other\n' > broken-package-project/other.go
+          # A main module that replaces its dependency with a local
+          # directory whose files declare two package names: a source
+          # error outside the main module that no download can fix
+          mkdir -p replace-project/app replace-project/dep
+          printf 'module example.com/dep\n\ngo 1.22\n' \
+            > replace-project/dep/go.mod
+          printf 'package dep\n\nfunc Name() string { return "" }\n' \
+            > replace-project/dep/dep.go
+          printf 'package other\n' > replace-project/dep/other.go
+          cat > replace-project/app/go.mod << 'EOF'
+          module example.com/replaceapp
+
+          go 1.22
+
+          require example.com/dep v0.0.0
+
+          replace example.com/dep => ../dep
+          EOF
+          cat > replace-project/app/main.go << 'EOF'
+          package main
+
+          import (
+              "fmt"
+
+              "example.com/dep"
+          )
+
+          func main() { fmt.Println(dep.Name()) }
+          EOF
+          # A versioned dependency, served by a file-based module
+          # proxy, whose files declare two package names: it downloads
+          # cleanly, so its source error is no fetch failure
+          python3 - "${PWD}/badpkg-proxy" << 'EOF'
+          import os
+          import sys
+          import zipfile
+
+          mod, ver = "example.com/badpkg", "v1.0.0"
+          root = os.path.join(sys.argv[1], mod, "@v")
+          os.makedirs(root)
+          gomod = "module " + mod + "\n\ngo 1.22\n"
+          files = {
+              "list": ver + "\n",
+              ver + ".info": '{"Version":"' + ver + '"}\n',
+              ver + ".mod": gomod,
+          }
+          for name, text in files.items():
+              with open(os.path.join(root, name), "w") as out:
+                  out.write(text)
+          prefix = mod + "@" + ver + "/"
+          with zipfile.ZipFile(os.path.join(root, ver + ".zip"), "w") as z:
+              z.writestr(prefix + "go.mod", gomod)
+              z.writestr(prefix + "badpkg.go", "package badpkg\n\n"
+                         "func Name() string { return \"\" }\n")
+              z.writestr(prefix + "other.go", "package other\n")
+          EOF
+          mkdir -p badpkg-project
+          cat > badpkg-project/go.mod << 'EOF'
+          module example.com/badpkgapp
+
+          go 1.22
+
+          require example.com/badpkg v1.0.0
+          EOF
+          cat > badpkg-project/main.go << 'EOF'
+          package main
+
+          import (
+              "fmt"
+
+              "example.com/badpkg"
+          )
+
+          func main() { fmt.Println(badpkg.Name()) }
+          EOF
+          # A vendored module whose go.mod predates automatic vendoring
+          # (go 1.13), while the ci.mod that GOFLAGS selects through
+          # -modfile says go 1.22, so go builds from the vendor tree
+          mkdir -p vendor-modfile-project
+          cp -R vendor-project/vendor vendor-project/main.go \
+            vendor-modfile-project/
+          cp vendor-project/go.mod vendor-modfile-project/ci.mod
+          printf 'module example.com/vendored\n\ngo 1.13\n' \
+            > vendor-modfile-project/go.mod
+          # A vendor directory that vendor mode could not build from
+          # (modules.txt lists a package with no source), so the build
+          # succeeds only when -mod=mod makes go ignore it
+          mkdir -p vendor-mod-project/vendor
+          cp dl-project/go.mod dl-project/go.sum dl-project/main.go \
+            vendor-mod-project/
+          printf '%s\n' '# github.com/google/uuid v1.6.0' \
+            '## explicit' github.com/google/uuid \
+            > vendor-mod-project/vendor/modules.txt
+          # A module with no vendor directory, built with an explicit
+          # empty -mod= that clears the -mod=vendor in GOFLAGS
+          mkdir -p empty-mod-project
+          cp dl-project/go.mod dl-project/go.sum dl-project/main.go \
+            empty-mod-project/
+          # A dependency-free parent module whose nested child module,
+          # selected through -C, needs the dependency
+          mkdir -p chdir-project/child
+          printf 'module example.com/parent\n\ngo 1.22\n' \
+            > chdir-project/go.mod
+          printf 'package main\n\nfunc main() {}\n' \
+            > chdir-project/main.go
+          sed 's/example.com\/dl/example.com\/child/' \
+            dl-project/go.mod > chdir-project/child/go.mod
+          cp dl-project/go.sum dl-project/main.go chdir-project/child/
+          # A module whose go.mod exists only in an overlay: go reads
+          # it through -overlay, so the download must find the module
+          # and run, with retries, before the offline build
+          mkdir -p overlay-project
+          sed 's/example.com\/dl/example.com\/overlay/' \
+            dl-project/go.mod > overlay-project/overlay.mod
+          cp dl-project/go.sum dl-project/main.go overlay-project/
+          printf '{"Replace":{"go.mod":"overlay.mod"}}\n' \
+            > overlay-project/overlay.json
+          # The overlay-only module again, with a -reuse in GOFLAGS
+          # that the overlay's main-module query must clear
+          cp -R overlay-project overlay-reuse-project
+          # The go 1.13 vendored module again, with the overlay rather
+          # than -modfile presenting the go 1.22 ci.mod as go.mod, so
+          # go builds from the vendor tree
+          cp -R vendor-modfile-project overlay-vendor-project
+          printf '{"Replace":{"go.mod":"ci.mod"}}\n' \
+            > overlay-vendor-project/overlay.json
+          echo "Module download fixtures created ✅"
+
+      # Local module proxies that each fail their first module zip
+      # request with a 503, then redirect every request to
+      # proxy.golang.org. Go probes several candidate module paths
+      # when it resolves an import and can ignore a failed probe,
+      # but every build needs the zip of the module it fetches, so
+      # the first download attempt always fails and the retry
+      # succeeds. Each retry case has its own port, so each sees
+      # one failure
+      - name: "Start flaky module proxy"
+        shell: bash
+        run: |
+          # Start flaky module proxy
+          cat > "${RUNNER_TEMP}/flaky-proxy.py" << 'EOF'
+          import sys
+          import threading
+          from http.server import (
+              BaseHTTPRequestHandler,
+              ThreadingHTTPServer,
+          )
+
+          UPSTREAM = "https://proxy.golang.org"
+          lock = threading.Lock()
+          failures = [int(sys.argv[2])]
+
+
+          class Handler(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  if self.path == "/healthz":
+                      self.send_response(200)
+                      self.end_headers()
+                      return
+                  with lock:
+                      fail = failures[0] > 0 and self.path.endswith(".zip")
+                      if fail:
+                          failures[0] -= 1
+                  if fail:
+                      self.send_error(503, "Injected failure")
+                      return
+                  self.send_response(302)
+                  self.send_header("Location", UPSTREAM + self.path)
+                  self.end_headers()
+
+
+          server = ThreadingHTTPServer(
+              ("127.0.0.1", int(sys.argv[1])), Handler
+          )
+          server.serve_forever()
+          EOF
+          for port in 8765 8766 8767 8768 8769; do
+            nohup python3 "${RUNNER_TEMP}/flaky-proxy.py" "${port}" 1 \
+              >> "${RUNNER_TEMP}/flaky-proxy.log" 2>&1 &
+          done
+          for port in 8765 8766 8767 8768 8769; do
+            ready=false
+            for _ in 1 2 3 4 5 6 7 8 9 10; do
+              if curl -fsS -o /dev/null \
+                "http://127.0.0.1:${port}/healthz"; then
+                ready=true
+                break
+              fi
+              sleep 1
+            done
+            if [ "${ready}" != "true" ]; then
+              echo "Error: flaky module proxy ${port} did not start ❌"
+              cat "${RUNNER_TEMP}/flaky-proxy.log"
+              exit 1
+            fi
+          done
+          echo "Flaky module proxies ready ✅"
+
+      # Each case uses its own empty module cache, so the download
+      # must reach the proxy rather than find modules already cached
+      - name: "Running local action: download retried after failure"
+        id: retry
+        uses: $/
+        env:
+          GOPROXY: http://127.0.0.1:8765
+          GOMODCACHE: ${{ runner.temp }}/modcache-retry
+          GOFLAGS: -modcacherw
+        with:
+          path_prefix: dl-project
+          go_version: '1.25.11'
+          build_target: '.'
+
+      - name: "Running local action: every download attempt fails"
+        id: exhausted
+        continue-on-error: true
+        uses: $/
+        env:
+          # Nothing listens on the discard port: connection refused
+          GOPROXY: http://127.0.0.1:9
+          GOMODCACHE: ${{ runner.temp }}/modcache-exhausted
+          GOFLAGS: -modcacherw
+        with:
+          path_prefix: dl-project
+          go_version: '1.25.11'
+          build_target: '.'
+          module_download_attempts: '2'
+
+      - name: "Running local action: compile error"
+        id: compile-error
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: broken-project
+          go_version: '1.25.11'
+          build_target: '.'
+
+      # The unreachable proxy proves the vendored build needs no
+      # network and that the action skips the download
+      - name: "Running local action: vendored module"
+        id: vendored
+        uses: $/
+        env:
+          GOPROXY: http://127.0.0.1:9
+          GOMODCACHE: ${{ runner.temp }}/modcache-vendored
+        with:
+          path_prefix: vendor-project
+          go_version: '1.25.11'
+          build_target: '.'
+
+      - name: "Running local action: Go workspace"
+        id: workspace
+        uses: $/
+        env:
+          GOMODCACHE: ${{ runner.temp }}/modcache-workspace
+          GOFLAGS: -modcacherw
+        with:
+          path_prefix: work-project/app
+          go_version: '1.25.11'
+          build_target: '.'
+
+      # The download must see -modfile too, or it fetches the go.mod
+      # graph and the offline build cannot find the ci.mod dependency
+      - name: "Running local action: alternate go.mod via -modfile"
+        id: modfile
+        uses: $/
+        env:
+          GOMODCACHE: ${{ runner.temp }}/modcache-modfile
+          GOFLAGS: -modcacherw
+        with:
+          path_prefix: modfile-project
+          go_version: '1.25.11'
+          build_target: '.'
+          build_flags: '-modfile=ci.mod'
+
+      # -mod=mod resolves an import go.mod lacks; the resolution must
+      # happen inside the retry, before the offline build, so the
+      # proxy's injected failure is retried and the build succeeds
+      - name: "Running local action: -mod=mod resolves a missing import"
+        id: missing
+        uses: $/
+        env:
+          GOPROXY: http://127.0.0.1:8766
+          GOMODCACHE: ${{ runner.temp }}/modcache-missing
+          GOFLAGS: -modcacherw -mod=mod
+        with:
+          path_prefix: missing-project
+          go_version: '1.25.11'
+          build_target: '.'
+
+      # go reads GOFLAGS with its own quoting rules: a quoted field
+      # and fields on separate lines must still select -mod=mod, or
+      # the action skips the resolution and the offline build fails
+      - name: "Running local action: quoted -mod=mod in GOFLAGS"
+        id: goflags-quoted
+        uses: $/
+        env:
+          GOMODCACHE: ${{ runner.temp }}/modcache-goflags-quoted
+          GOFLAGS: '-modcacherw "-mod=mod"'
+        with:
+          path_prefix: missing-quoted-project
+          go_version: '1.25.11'
+          build_target: '.'
+
+      - name: "Running local action: multiline GOFLAGS"
+        id: goflags-multiline
+        uses: $/
+        env:
+          GOMODCACHE: ${{ runner.temp }}/modcache-goflags-multiline
+          GOFLAGS: |
+            -modcacherw
+            -mod=mod
+        with:
+          path_prefix: missing-multiline-project
+          go_version: '1.25.11'
+          build_target: '.'
+
+      # -json, in GOFLAGS and build_flags, must not reach go list -f
+      # or go env, which would fail or answer in JSON
+      - name: "Running local action: -json in GOFLAGS and build_flags"
+        id: goflags-json
+        uses: $/
+        env:
+          GOMODCACHE: ${{ runner.temp }}/modcache-goflags-json
+          GOFLAGS: -modcacherw -mod=mod -json
+        with:
+          path_prefix: missing-json-project
+          go_version: '1.25.11'
+          build_target: '.'
+          build_flags: '-json'
+
+      # go list rejects -find with -deps; the action's go list must
+      # override a -find from GOFLAGS, which go build ignores
+      - name: "Running local action: -find in GOFLAGS"
+        id: goflags-find
+        uses: $/
+        env:
+          GOMODCACHE: ${{ runner.temp }}/modcache-goflags-find
+          GOFLAGS: -modcacherw -mod=mod -find
+        with:
+          path_prefix: missing-find-project
+          go_version: '1.25.11'
+          build_target: '.'
+
+      # go list rejects -reuse without -m or inside a module; the
+      # action's go list must clear a -reuse from GOFLAGS, which go
+      # build ignores
+      - name: "Running local action: -reuse in GOFLAGS"
+        id: goflags-reuse
+        uses: $/
+        env:
+          GOMODCACHE: ${{ runner.temp }}/modcache-goflags-reuse
+          GOFLAGS: -modcacherw -mod=mod -reuse=previous.json
+        with:
+          path_prefix: missing-reuse-project
+          go_version: '1.25.11'
+          build_target: '.'
+
+      # go env applies GOFLAGS: an inherited -u or -w, which go build
+      # ignores, must not turn the action's go env reads into writes,
+      # nor -changed empty them
+      - name: "Running local action: go env flags in GOFLAGS"
+        id: goflags-goenv
+        uses: $/
+        env:
+          GOMODCACHE: ${{ runner.temp }}/modcache-goflags-goenv
+          GOFLAGS: -modcacherw -mod=mod -u -w -changed
+        with:
+          path_prefix: missing-goenv-project
+          go_version: '1.25.11'
+          build_target: '.'
+
+      # A source error under -mod=mod must not be retried as a
+      # download failure: one download attempt, then the build fails
+      - name: "Running local action: broken package with -mod=mod"
+        id: broken-package
+        continue-on-error: true
+        uses: $/
+        env:
+          GOMODCACHE: ${{ runner.temp }}/modcache-broken-package
+          GOFLAGS: -modcacherw -mod=mod
+        with:
+          path_prefix: broken-package-project
+          go_version: '1.25.11'
+          build_target: '.'
+
+      # The same source error with the files named as the target: go
+      # list reports them as command-line-arguments, with no module,
+      # which must not be retried either
+      - name: "Running local action: broken file list with -mod=mod"
+        id: broken-files
+        continue-on-error: true
+        uses: $/
+        env:
+          GOMODCACHE: ${{ runner.temp }}/modcache-broken-files
+          GOFLAGS: -modcacherw -mod=mod
+        with:
+          path_prefix: broken-package-project
+          go_version: '1.25.11'
+          build_target: 'main.go other.go'
+
+      # A source error in a module replaced by a local directory is
+      # not a download failure either: go mod download skips the
+      # replacement, so one attempt, then the build fails
+      - name: "Running local action: broken local replacement"
+        id: broken-replace
+        continue-on-error: true
+        uses: $/
+        env:
+          GOMODCACHE: ${{ runner.temp }}/modcache-broken-replace
+          GOFLAGS: -modcacherw -mod=mod
+        with:
+          path_prefix: replace-project/app
+          go_version: '1.25.11'
+          build_target: '.'
+
+      # A source error in a versioned dependency already downloaded
+      # into the module cache is not a download failure either: one
+      # attempt, then the build fails
+      - name: "Running local action: broken versioned dependency"
+        id: broken-versioned
+        continue-on-error: true
+        uses: $/
+        env:
+          GOPROXY: file://${{ github.workspace }}/badpkg-proxy
+          GONOSUMDB: example.com/badpkg
+          GOMODCACHE: ${{ runner.temp }}/modcache-broken-versioned
+          GOFLAGS: -modcacherw -mod=mod
+        with:
+          path_prefix: badpkg-project
+          go_version: '1.25.11'
+          build_target: '.'
+
+      # The -modfile in GOFLAGS decides the go version that selects
+      # vendor mode; the unreachable proxy proves no download runs
+      - name: "Running local action: vendor mode via GOFLAGS -modfile"
+        id: vendor-modfile
+        uses: $/
+        env:
+          GOPROXY: http://127.0.0.1:9
+          GOMODCACHE: ${{ runner.temp }}/modcache-vendor-modfile
+          GOFLAGS: -modfile=ci.mod
+        with:
+          path_prefix: vendor-modfile-project
+          go_version: '1.25.11'
+          build_target: '.'
+
+      # vendor/modules.txt is present, but -mod=mod in build_flags
+      # (winning over -mod=vendor in GOFLAGS) means go ignores the
+      # vendor directory, so the download must run and be retried
+      - name: "Running local action: vendor directory with -mod=mod"
+        id: vendor-mod
+        uses: $/
+        env:
+          GOPROXY: http://127.0.0.1:8767
+          GOMODCACHE: ${{ runner.temp }}/modcache-vendor-mod
+          GOFLAGS: -modcacherw -mod=vendor
+        with:
+          path_prefix: vendor-mod-project
+          go_version: '1.25.11'
+          build_target: '.'
+          build_flags: '-mod=mod'
+
+      # An explicit empty -mod= in build_flags clears -mod=vendor
+      # from GOFLAGS, so go does not use vendor mode: the download
+      # must run and be retried rather than be skipped
+      - name: "Running local action: empty -mod= over GOFLAGS vendor"
+        id: empty-mod
+        uses: $/
+        env:
+          GOPROXY: http://127.0.0.1:8768
+          GOMODCACHE: ${{ runner.temp }}/modcache-empty-mod
+          GOFLAGS: -modcacherw -mod=vendor
+        with:
+          path_prefix: empty-mod-project
+          go_version: '1.25.11'
+          build_target: '.'
+          build_flags: '-mod='
+
+      # go env GOMOD misses a go.mod that only the overlay supplies;
+      # the download must still run, and be retried, or the build
+      # fetches outside the retry and meets the proxy's failure
+      - name: "Running local action: go.mod only in an overlay"
+        id: overlay-module
+        uses: $/
+        env:
+          GOPROXY: http://127.0.0.1:8769
+          GOMODCACHE: ${{ runner.temp }}/modcache-overlay-module
+          GOFLAGS: -modcacherw
+        with:
+          path_prefix: overlay-project
+          go_version: '1.25.11'
+          build_target: '.'
+          build_flags: '-overlay=overlay.json'
+
+      # A GOFLAGS -reuse made the overlay's main-module query fail, so
+      # the overlay-only go.mod was missed and the download skipped
+      - name: "Running local action: overlay with -reuse in GOFLAGS"
+        id: overlay-reuse
+        uses: $/
+        env:
+          GOMODCACHE: ${{ runner.temp }}/modcache-overlay-reuse
+          GOFLAGS: -modcacherw -reuse=previous.json
+        with:
+          path_prefix: overlay-reuse-project
+          go_version: '1.25.11'
+          build_target: '.'
+          build_flags: '-overlay=overlay.json'
+
+      # The overlaid go.mod's go 1.22 selects vendor mode, though the
+      # go.mod on disk says go 1.13; the unreachable proxy proves no
+      # download runs
+      - name: "Running local action: vendor mode via overlaid go.mod"
+        id: overlay-vendor
+        uses: $/
+        env:
+          GOPROXY: http://127.0.0.1:9
+          GOMODCACHE: ${{ runner.temp }}/modcache-overlay-vendor
+        with:
+          path_prefix: overlay-vendor-project
+          go_version: '1.25.11'
+          build_target: '.'
+          build_flags: '-overlay=overlay.json'
+
+      # -C must move discovery and the download along with the build,
+      # or the parent's empty graph is fetched and the child fails
+      - name: "Running local action: nested module via -C"
+        id: chdir
+        uses: $/
+        env:
+          GOMODCACHE: ${{ runner.temp }}/modcache-chdir
+          GOFLAGS: -modcacherw
+        with:
+          path_prefix: chdir-project
+          go_version: '1.25.11'
+          build_target: '.'
+          build_flags: '-trimpath -C child'
+          output_name: chdir-binary
+
+      # The -C after -gcflags is the compiler's flag (omit columns),
+      # not a directory change; only the second -C moves the build
+      - name: "Running local action: -C as a -gcflags value"
+        id: chdir-gcflags
+        uses: $/
+        env:
+          GOMODCACHE: ${{ runner.temp }}/modcache-chdir-gcflags
+          GOFLAGS: -modcacherw
+        with:
+          path_prefix: chdir-project
+          go_version: '1.25.11'
+          build_target: '.'
+          build_flags: '-gcflags -C -C child'
+          output_name: chdir-gcflags-binary
+
+      - name: "Running local action: -C escaping the workspace"
+        id: chdir-escape
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: chdir-project
+          go_version: '1.25.11'
+          build_target: '.'
+          build_flags: '-C ../..'
+
+      - name: "Verify module download behaviour"
+        shell: bash
+        env:
+          RETRY_OUTCOME: ${{ steps.retry.outcome }}
+          RETRY_DL: ${{ steps.retry.outputs.module_download_outcome }}
+          # yamllint disable-line rule:line-length
+          RETRY_ATTEMPTS: ${{ steps.retry.outputs.module_download_attempts_used }}
+          EXHAUSTED_OUTCOME: ${{ steps.exhausted.outcome }}
+          # yamllint disable-line rule:line-length
+          EXHAUSTED_DL: ${{ steps.exhausted.outputs.module_download_outcome }}
+          # yamllint disable-line rule:line-length
+          EXHAUSTED_ATTEMPTS: ${{ steps.exhausted.outputs.module_download_attempts_used }}
+          COMPILE_OUTCOME: ${{ steps.compile-error.outcome }}
+          # yamllint disable-line rule:line-length
+          COMPILE_DL: ${{ steps.compile-error.outputs.module_download_outcome }}
+          # yamllint disable-line rule:line-length
+          COMPILE_ATTEMPTS: ${{ steps.compile-error.outputs.module_download_attempts_used }}
+          VENDORED_OUTCOME: ${{ steps.vendored.outcome }}
+          VENDORED_DL: ${{ steps.vendored.outputs.module_download_outcome }}
+          # yamllint disable-line rule:line-length
+          VENDORED_ATTEMPTS: ${{ steps.vendored.outputs.module_download_attempts_used }}
+          WORKSPACE_OUTCOME: ${{ steps.workspace.outcome }}
+          WORKSPACE_DL: ${{ steps.workspace.outputs.module_download_outcome }}
+          # yamllint disable-line rule:line-length
+          WORKSPACE_ATTEMPTS: ${{ steps.workspace.outputs.module_download_attempts_used }}
+          MODFILE_OUTCOME: ${{ steps.modfile.outcome }}
+          MODFILE_DL: ${{ steps.modfile.outputs.module_download_outcome }}
+          # yamllint disable-line rule:line-length
+          MODFILE_ATTEMPTS: ${{ steps.modfile.outputs.module_download_attempts_used }}
+          MISSING_OUTCOME: ${{ steps.missing.outcome }}
+          MISSING_DL: ${{ steps.missing.outputs.module_download_outcome }}
+          # yamllint disable-line rule:line-length
+          MISSING_ATTEMPTS: ${{ steps.missing.outputs.module_download_attempts_used }}
+          GOFLAGS_QUOTED_OUTCOME: ${{ steps.goflags-quoted.outcome }}
+          # yamllint disable-line rule:line-length
+          GOFLAGS_QUOTED_DL: ${{ steps.goflags-quoted.outputs.module_download_outcome }}
+          # yamllint disable-line rule:line-length
+          GOFLAGS_QUOTED_ATTEMPTS: ${{ steps.goflags-quoted.outputs.module_download_attempts_used }}
+          GOFLAGS_MULTILINE_OUTCOME: ${{ steps.goflags-multiline.outcome }}
+          # yamllint disable-line rule:line-length
+          GOFLAGS_MULTILINE_DL: ${{ steps.goflags-multiline.outputs.module_download_outcome }}
+          # yamllint disable-line rule:line-length
+          GOFLAGS_MULTILINE_ATTEMPTS: ${{ steps.goflags-multiline.outputs.module_download_attempts_used }}
+          GOFLAGS_JSON_OUTCOME: ${{ steps.goflags-json.outcome }}
+          # yamllint disable-line rule:line-length
+          GOFLAGS_JSON_DL: ${{ steps.goflags-json.outputs.module_download_outcome }}
+          # yamllint disable-line rule:line-length
+          GOFLAGS_JSON_ATTEMPTS: ${{ steps.goflags-json.outputs.module_download_attempts_used }}
+          GOFLAGS_FIND_OUTCOME: ${{ steps.goflags-find.outcome }}
+          # yamllint disable-line rule:line-length
+          GOFLAGS_FIND_DL: ${{ steps.goflags-find.outputs.module_download_outcome }}
+          # yamllint disable-line rule:line-length
+          GOFLAGS_FIND_ATTEMPTS: ${{ steps.goflags-find.outputs.module_download_attempts_used }}
+          GOFLAGS_REUSE_OUTCOME: ${{ steps.goflags-reuse.outcome }}
+          # yamllint disable-line rule:line-length
+          GOFLAGS_REUSE_DL: ${{ steps.goflags-reuse.outputs.module_download_outcome }}
+          # yamllint disable-line rule:line-length
+          GOFLAGS_REUSE_ATTEMPTS: ${{ steps.goflags-reuse.outputs.module_download_attempts_used }}
+          GOFLAGS_GOENV_OUTCOME: ${{ steps.goflags-goenv.outcome }}
+          # yamllint disable-line rule:line-length
+          GOFLAGS_GOENV_DL: ${{ steps.goflags-goenv.outputs.module_download_outcome }}
+          # yamllint disable-line rule:line-length
+          GOFLAGS_GOENV_ATTEMPTS: ${{ steps.goflags-goenv.outputs.module_download_attempts_used }}
+          BROKEN_PACKAGE_OUTCOME: ${{ steps.broken-package.outcome }}
+          # yamllint disable-line rule:line-length
+          BROKEN_PACKAGE_DL: ${{ steps.broken-package.outputs.module_download_outcome }}
+          # yamllint disable-line rule:line-length
+          BROKEN_PACKAGE_ATTEMPTS: ${{ steps.broken-package.outputs.module_download_attempts_used }}
+          BROKEN_FILES_OUTCOME: ${{ steps.broken-files.outcome }}
+          # yamllint disable-line rule:line-length
+          BROKEN_FILES_DL: ${{ steps.broken-files.outputs.module_download_outcome }}
+          # yamllint disable-line rule:line-length
+          BROKEN_FILES_ATTEMPTS: ${{ steps.broken-files.outputs.module_download_attempts_used }}
+          BROKEN_REPLACE_OUTCOME: ${{ steps.broken-replace.outcome }}
+          # yamllint disable-line rule:line-length
+          BROKEN_REPLACE_DL: ${{ steps.broken-replace.outputs.module_download_outcome }}
+          # yamllint disable-line rule:line-length
+          BROKEN_REPLACE_ATTEMPTS: ${{ steps.broken-replace.outputs.module_download_attempts_used }}
+          BROKEN_VERSIONED_OUTCOME: ${{ steps.broken-versioned.outcome }}
+          # yamllint disable-line rule:line-length
+          BROKEN_VERSIONED_DL: ${{ steps.broken-versioned.outputs.module_download_outcome }}
+          # yamllint disable-line rule:line-length
+          BROKEN_VERSIONED_ATTEMPTS: ${{ steps.broken-versioned.outputs.module_download_attempts_used }}
+          VENDOR_MODFILE_OUTCOME: ${{ steps.vendor-modfile.outcome }}
+          # yamllint disable-line rule:line-length
+          VENDOR_MODFILE_DL: ${{ steps.vendor-modfile.outputs.module_download_outcome }}
+          # yamllint disable-line rule:line-length
+          VENDOR_MODFILE_ATTEMPTS: ${{ steps.vendor-modfile.outputs.module_download_attempts_used }}
+          VENDOR_MOD_OUTCOME: ${{ steps.vendor-mod.outcome }}
+          # yamllint disable-line rule:line-length
+          VENDOR_MOD_DL: ${{ steps.vendor-mod.outputs.module_download_outcome }}
+          # yamllint disable-line rule:line-length
+          VENDOR_MOD_ATTEMPTS: ${{ steps.vendor-mod.outputs.module_download_attempts_used }}
+          EMPTY_MOD_OUTCOME: ${{ steps.empty-mod.outcome }}
+          # yamllint disable-line rule:line-length
+          EMPTY_MOD_DL: ${{ steps.empty-mod.outputs.module_download_outcome }}
+          # yamllint disable-line rule:line-length
+          EMPTY_MOD_ATTEMPTS: ${{ steps.empty-mod.outputs.module_download_attempts_used }}
+          OVERLAY_MODULE_OUTCOME: ${{ steps.overlay-module.outcome }}
+          # yamllint disable-line rule:line-length
+          OVERLAY_MODULE_DL: ${{ steps.overlay-module.outputs.module_download_outcome }}
+          # yamllint disable-line rule:line-length
+          OVERLAY_MODULE_ATTEMPTS: ${{ steps.overlay-module.outputs.module_download_attempts_used }}
+          OVERLAY_REUSE_OUTCOME: ${{ steps.overlay-reuse.outcome }}
+          # yamllint disable-line rule:line-length
+          OVERLAY_REUSE_DL: ${{ steps.overlay-reuse.outputs.module_download_outcome }}
+          # yamllint disable-line rule:line-length
+          OVERLAY_REUSE_ATTEMPTS: ${{ steps.overlay-reuse.outputs.module_download_attempts_used }}
+          OVERLAY_VENDOR_OUTCOME: ${{ steps.overlay-vendor.outcome }}
+          # yamllint disable-line rule:line-length
+          OVERLAY_VENDOR_DL: ${{ steps.overlay-vendor.outputs.module_download_outcome }}
+          # yamllint disable-line rule:line-length
+          OVERLAY_VENDOR_ATTEMPTS: ${{ steps.overlay-vendor.outputs.module_download_attempts_used }}
+          CHDIR_OUTCOME: ${{ steps.chdir.outcome }}
+          CHDIR_DL: ${{ steps.chdir.outputs.module_download_outcome }}
+          # yamllint disable-line rule:line-length
+          CHDIR_ATTEMPTS: ${{ steps.chdir.outputs.module_download_attempts_used }}
+          CHDIR_BINARY: ${{ steps.chdir.outputs.binary_path }}
+          CHDIR_GCFLAGS_OUTCOME: ${{ steps.chdir-gcflags.outcome }}
+          # yamllint disable-line rule:line-length
+          CHDIR_GCFLAGS_DL: ${{ steps.chdir-gcflags.outputs.module_download_outcome }}
+          # yamllint disable-line rule:line-length
+          CHDIR_GCFLAGS_ATTEMPTS: ${{ steps.chdir-gcflags.outputs.module_download_attempts_used }}
+          # yamllint disable-line rule:line-length
+          CHDIR_GCFLAGS_BINARY: ${{ steps.chdir-gcflags.outputs.binary_path }}
+          CHDIR_ESCAPE_OUTCOME: ${{ steps.chdir-escape.outcome }}
+          # yamllint disable-line rule:line-length
+          CHDIR_ESCAPE_DL: ${{ steps.chdir-escape.outputs.module_download_outcome }}
+        run: |
+          # Verify module download behaviour
+          # Each case: name, step outcome, download outcome, attempts
+          errors=0
+          check() {
+            if [ "$2" != "$5" ] || [ "$3" != "$6" ] || [ "$4" != "$7" ]
+            then
+              echo "$1: expected $5/$6/$7, got $2/$3/$4 ❌"
+              errors=1
+            fi
+          }
+          check retry "${RETRY_OUTCOME}" "${RETRY_DL}" \
+            "${RETRY_ATTEMPTS}" success success 2
+          check exhausted "${EXHAUSTED_OUTCOME}" "${EXHAUSTED_DL}" \
+            "${EXHAUSTED_ATTEMPTS}" failure failure 2
+          check compile-error "${COMPILE_OUTCOME}" "${COMPILE_DL}" \
+            "${COMPILE_ATTEMPTS}" failure success 1
+          check vendored "${VENDORED_OUTCOME}" "${VENDORED_DL}" \
+            "${VENDORED_ATTEMPTS}" success skipped 0
+          check workspace "${WORKSPACE_OUTCOME}" "${WORKSPACE_DL}" \
+            "${WORKSPACE_ATTEMPTS}" success success 1
+          check modfile "${MODFILE_OUTCOME}" "${MODFILE_DL}" \
+            "${MODFILE_ATTEMPTS}" success success 1
+          check missing "${MISSING_OUTCOME}" "${MISSING_DL}" \
+            "${MISSING_ATTEMPTS}" success success 2
+          check goflags-quoted "${GOFLAGS_QUOTED_OUTCOME}" \
+            "${GOFLAGS_QUOTED_DL}" "${GOFLAGS_QUOTED_ATTEMPTS}" \
+            success success 1
+          check goflags-multiline "${GOFLAGS_MULTILINE_OUTCOME}" \
+            "${GOFLAGS_MULTILINE_DL}" "${GOFLAGS_MULTILINE_ATTEMPTS}" \
+            success success 1
+          check goflags-json "${GOFLAGS_JSON_OUTCOME}" \
+            "${GOFLAGS_JSON_DL}" "${GOFLAGS_JSON_ATTEMPTS}" \
+            success success 1
+          check goflags-find "${GOFLAGS_FIND_OUTCOME}" \
+            "${GOFLAGS_FIND_DL}" "${GOFLAGS_FIND_ATTEMPTS}" \
+            success success 1
+          check goflags-reuse "${GOFLAGS_REUSE_OUTCOME}" \
+            "${GOFLAGS_REUSE_DL}" "${GOFLAGS_REUSE_ATTEMPTS}" \
+            success success 1
+          check goflags-goenv "${GOFLAGS_GOENV_OUTCOME}" \
+            "${GOFLAGS_GOENV_DL}" "${GOFLAGS_GOENV_ATTEMPTS}" \
+            success success 1
+          check broken-package "${BROKEN_PACKAGE_OUTCOME}" \
+            "${BROKEN_PACKAGE_DL}" "${BROKEN_PACKAGE_ATTEMPTS}" \
+            failure success 1
+          check broken-files "${BROKEN_FILES_OUTCOME}" \
+            "${BROKEN_FILES_DL}" "${BROKEN_FILES_ATTEMPTS}" \
+            failure success 1
+          check broken-replace "${BROKEN_REPLACE_OUTCOME}" \
+            "${BROKEN_REPLACE_DL}" "${BROKEN_REPLACE_ATTEMPTS}" \
+            failure success 1
+          check broken-versioned "${BROKEN_VERSIONED_OUTCOME}" \
+            "${BROKEN_VERSIONED_DL}" "${BROKEN_VERSIONED_ATTEMPTS}" \
+            failure success 1
+          check vendor-modfile "${VENDOR_MODFILE_OUTCOME}" \
+            "${VENDOR_MODFILE_DL}" "${VENDOR_MODFILE_ATTEMPTS}" \
+            success skipped 0
+          check vendor-mod "${VENDOR_MOD_OUTCOME}" "${VENDOR_MOD_DL}" \
+            "${VENDOR_MOD_ATTEMPTS}" success success 2
+          check empty-mod "${EMPTY_MOD_OUTCOME}" "${EMPTY_MOD_DL}" \
+            "${EMPTY_MOD_ATTEMPTS}" success success 2
+          check overlay-module "${OVERLAY_MODULE_OUTCOME}" \
+            "${OVERLAY_MODULE_DL}" "${OVERLAY_MODULE_ATTEMPTS}" \
+            success success 2
+          check overlay-reuse "${OVERLAY_REUSE_OUTCOME}" \
+            "${OVERLAY_REUSE_DL}" "${OVERLAY_REUSE_ATTEMPTS}" \
+            success success 1
+          check overlay-vendor "${OVERLAY_VENDOR_OUTCOME}" \
+            "${OVERLAY_VENDOR_DL}" "${OVERLAY_VENDOR_ATTEMPTS}" \
+            success skipped 0
+          check chdir "${CHDIR_OUTCOME}" "${CHDIR_DL}" \
+            "${CHDIR_ATTEMPTS}" success success 1
+          if [ ! -x "${CHDIR_BINARY}" ] ||
+            [ "${CHDIR_BINARY}" != \
+              "${GITHUB_WORKSPACE}/chdir-project/chdir-binary" ]; then
+            echo "chdir: binary missing from the project directory ❌"
+            errors=1
+          fi
+          check chdir-gcflags "${CHDIR_GCFLAGS_OUTCOME}" \
+            "${CHDIR_GCFLAGS_DL}" "${CHDIR_GCFLAGS_ATTEMPTS}" \
+            success success 1
+          if [ ! -x "${CHDIR_GCFLAGS_BINARY}" ] ||
+            [ "${CHDIR_GCFLAGS_BINARY}" != \
+              "${GITHUB_WORKSPACE}/chdir-project/chdir-gcflags-binary" ]
+          then
+            echo "chdir-gcflags: binary missing ❌"
+            errors=1
+          fi
+          # The escape fails before any download is attempted
+          if [ "${CHDIR_ESCAPE_OUTCOME}" != "failure" ] ||
+            [ -n "${CHDIR_ESCAPE_DL}" ]; then
+            echo "chdir-escape: expected failure before download ❌"
+            errors=1
+          fi
+          echo "Flaky module proxy log:"
+          cat "${RUNNER_TEMP}/flaky-proxy.log"
+          if [ "${errors}" != "0" ]; then
+            echo "Module download verification failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Module download behaviour verified ✅"
+          echo "Module download behaviour verified ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
 
   ### Test invalid inputs fail closed ###
   test-failures:
@@ -509,6 +1493,22 @@ jobs:
         with:
           build_target: '-x'
 
+      - &failures-attempts-zero
+        name: "Running local action with zero download attempts"
+        id: attempts-zero
+        continue-on-error: true
+        uses: $/
+        with:
+          module_download_attempts: '0'
+
+      - &failures-attempts-high
+        name: "Running local action with too many download attempts"
+        id: attempts-high
+        continue-on-error: true
+        uses: $/
+        with:
+          module_download_attempts: '11'
+
       - &failures-verify
         name: "Verify invalid inputs were rejected"
         shell: bash
@@ -528,6 +1528,8 @@ jobs:
           BOOL_OUTCOME: ${{ steps.bad-bool.outcome }}
           UPLOAD_OUTCOME: ${{ steps.upload-no-output.outcome }}
           TARGET_OUTCOME: ${{ steps.bad-target.outcome }}
+          ATTEMPTS_ZERO_OUTCOME: ${{ steps.attempts-zero.outcome }}
+          ATTEMPTS_HIGH_OUTCOME: ${{ steps.attempts-high.outcome }}
         run: |
           # Failure testing is also important; all steps MUST fail
           errors=0
@@ -546,7 +1548,9 @@ jobs:
             "output:${OUTPUT_OUTCOME}" \
             "bool:${BOOL_OUTCOME}" \
             "upload:${UPLOAD_OUTCOME}" \
-            "target:${TARGET_OUTCOME}"; do
+            "target:${TARGET_OUTCOME}" \
+            "attempts-zero:${ATTEMPTS_ZERO_OUTCOME}" \
+            "attempts-high:${ATTEMPTS_HIGH_OUTCOME}"; do
             test_name="${outcome_pair%%:*}"
             outcome="${outcome_pair#*:}"
             if [ "${outcome}" = "success" ]; then
@@ -594,4 +1598,6 @@ jobs:
       - *failures-bad-bool
       - *failures-upload-no-output
       - *failures-bad-target
+      - *failures-attempts-zero
+      - *failures-attempts-high
       - *failures-verify

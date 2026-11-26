@@ -70,6 +70,11 @@ inputs:
     description: "Artifact name; allowed characters: A-Z a-z 0-9 . _ -"
     required: false
     default: "go-binary"
+  module_download_attempts:
+    # yamllint disable-line rule:line-length
+    description: "Attempts at go mod download before the build fails; an integer from 1 to 10"
+    required: false
+    default: "3"
 
 outputs:
   binary_path:
@@ -78,6 +83,13 @@ outputs:
   go_version_used:
     description: "Go toolchain version the build used"
     value: ${{ steps.build.outputs.go_version_used }}
+  module_download_outcome:
+    # yamllint disable-line rule:line-length
+    description: "Result of the module download: success, failure or skipped"
+    value: ${{ steps.build.outputs.module_download_outcome }}
+  module_download_attempts_used:
+    description: "go mod download attempts made; 0 when skipped"
+    value: ${{ steps.build.outputs.module_download_attempts_used }}
 
 runs:
   using: "composite"
@@ -98,6 +110,7 @@ runs:
         INPUT_BUILD_TARGET: ${{ inputs.build_target }}
         INPUT_ARTIFACT_UPLOAD: ${{ inputs.artifact_upload }}
         INPUT_ARTIFACT_NAME: ${{ inputs.artifact_name }}
+        INPUT_MODULE_DOWNLOAD_ATTEMPTS: ${{ inputs.module_download_attempts }}
       run: |
         # Validate inputs
         # Probe for GNU coreutils realpath: it supports -m, while the
@@ -219,6 +232,15 @@ runs:
           0|1) ;;
           *)
             echo "Error: cgo_enabled must be '0' or '1' ❌"
+            exit 1 ;;
+        esac
+        # Whole-string match: rejects leading zeros, signs, whitespace
+        # and embedded newlines as well as values outside 1-10
+        case "${INPUT_MODULE_DOWNLOAD_ATTEMPTS}" in
+          [1-9]|10) ;;
+          *)
+            echo "Error: invalid module_download_attempts ❌"
+            echo "Expected an integer from 1 to 10"
             exit 1 ;;
         esac
         # A case glob validates the entire string, including embedded
@@ -444,6 +466,12 @@ runs:
         go-version-file: ${{ steps.validate.outputs.setup_go_version_file }}
         # Org security stance: no dependency/toolchain caching
         cache: false
+      # setup-go runs a plain go env GOPATH, which applies GOFLAGS: an
+      # inherited -u with -w fails it, and -changed empties it. Clear
+      # GOFLAGS for this step alone; the download and the build below
+      # still see the caller's value
+      env:
+        GOFLAGS: ''
 
     - name: "Build project"
       id: build
@@ -454,6 +482,7 @@ runs:
         LDFLAGS: ${{ inputs.ldflags }}
         OUTPUT_NAME: ${{ inputs.output_name }}
         BUILD_TARGET: ${{ inputs.build_target }}
+        MODULE_DOWNLOAD_ATTEMPTS: ${{ inputs.module_download_attempts }}
         # GOOS/GOARCH/CGO_ENABLED are consumed by the go toolchain;
         # empty GOOS/GOARCH values select the runner platform
         GOOS: ${{ inputs.goos }}
@@ -569,6 +598,15 @@ runs:
             printf '%s\n' "$1"
           fi
         }
+        # The reverse for native paths read on Windows: go env reports
+        # them (C:\...\go.mod, NUL), and a caller may pass one to -C
+        posix_path() {
+          if [ "${RUNNER_OS:-}" = "Windows" ]; then
+            cygpath -u -- "$1"
+          else
+            printf '%s\n' "$1"
+          fi
+        }
         # Re-resolve and enforce the workspace boundary at the point
         # of use: the workspace is mutable between steps, so relying
         # solely on the earlier validate step would leave a TOCTOU
@@ -576,12 +614,20 @@ runs:
         # Each resolve_path call fails closed: an empty result would
         # degrade the boundary case pattern to /* and disable the
         # escape check
-        if ! PROJECT_DIR="$(resolve_path "${PROJECT_DIR}")" ||
+        # On Windows, convert both sides to the POSIX form a native -C
+        # directory takes below before resolving: realpath does not
+        # turn GITHUB_WORKSPACE (D:\a\...) into /d/a/..., so a -C
+        # inside the workspace would otherwise compare as outside it
+        if ! PROJECT_DIR="$(posix_path "${PROJECT_DIR}")" ||
+          [ -z "${PROJECT_DIR}" ] ||
+          ! PROJECT_DIR="$(resolve_path "${PROJECT_DIR}")" ||
           [ -z "${PROJECT_DIR}" ]; then
           echo "Error: failed to resolve project directory ❌"
           exit 1
         fi
-        if ! boundary="$(resolve_path "${GITHUB_WORKSPACE:?}")" ||
+        if ! boundary="$(posix_path "${GITHUB_WORKSPACE:?}")" ||
+          [ -z "${boundary}" ] ||
+          ! boundary="$(resolve_path "${boundary}")" ||
           [ -z "${boundary}" ]; then
           echo "Error: failed to resolve GITHUB_WORKSPACE ❌"
           exit 1
@@ -609,6 +655,464 @@ runs:
           echo "Error: cannot change to project directory ❌"
           exit 1
         fi
+        # Take any -C flag out of build_flags and apply it here: go
+        # build accepts -C only as its first flag, and module
+        # discovery, vendor detection and the download below must all
+        # run in the directory the build uses. The directory resolves
+        # relative to path_prefix and must stay within the workspace
+        # The scans below follow go's flag parsing: the argument after
+        # a value-taking flag is its value, never a flag (-gcflags -C
+        # passes -C to the compiler), and the first non-flag argument
+        # or -- ends the flags
+        flag_takes_value() {
+          local name="${1#-}"
+          case "${name#-}" in
+            C|p|o|asmflags|buildmode|compiler|covermode|coverpkg|\
+            debug-actiongraph|debug-runtime-trace|debug-trace|\
+            gccgoflags|gcflags|installsuffix|ldflags|mod|modfile|\
+            overlay|pgo|pkgdir|tags|toolexec)
+              return 0 ;;
+          esac
+          return 1
+        }
+        build_args=()
+        chdir_count=0
+        chdir=""
+        i=0
+        while [ "${i}" -lt "${#args[@]}" ]; do
+          flag="${args[${i}]}"
+          case "${flag}" in
+            -C|--C)
+              chdir_count=$((chdir_count + 1))
+              i=$((i + 1))
+              chdir="${args[${i}]:-}" ;;
+            -C=*|--C=*)
+              chdir_count=$((chdir_count + 1))
+              chdir="${flag#*=}" ;;
+            --|-|[!-]*)
+              build_args+=("${args[@]:${i}}")
+              break ;;
+            *)
+              build_args+=("${flag}")
+              if flag_takes_value "${flag}" &&
+                [ $((i + 1)) -lt "${#args[@]}" ]; then
+                i=$((i + 1))
+                build_args+=("${args[${i}]}")
+              fi ;;
+          esac
+          i=$((i + 1))
+        done
+        if [ "${chdir_count}" -gt 1 ] ||
+          { [ "${chdir_count}" -eq 1 ] && [ -z "${chdir}" ]; }; then
+          echo "Error: build_flags needs one -C with a directory ❌"
+          exit 1
+        fi
+        if [ "${chdir_count}" -eq 1 ]; then
+          # Convert a native Windows path (D:/a/...) first, or it reads
+          # as relative and lands under PROJECT_DIR
+          if ! chdir="$(posix_path "${chdir}")" || [ -z "${chdir}" ]; then
+            echo "Error: cannot convert the -C directory ❌"
+            exit 1
+          fi
+          case "${chdir}" in
+            /*) ;;
+            *) chdir="${PROJECT_DIR}/${chdir}" ;;
+          esac
+          if ! chdir="$(resolve_path "${chdir}")" ||
+            [ -z "${chdir}" ] || [ ! -d "${chdir}" ]; then
+            echo "Error: cannot resolve the -C directory ❌"
+            exit 1
+          fi
+          case "${chdir}/" in
+            "${boundary}/"*) ;;
+            *)
+              echo "Error: -C directory escapes the workspace ❌"
+              echo "-C must resolve within GITHUB_WORKSPACE"
+              exit 1 ;;
+          esac
+          if ! cd "${chdir}"; then
+            echo "Error: cannot change to the -C directory ❌"
+            exit 1
+          fi
+        fi
+        args=("${build_args[@]}")
+        # Fetch modules before building, retrying on failure: with
+        # module caching off every run downloads every module, and one
+        # dropped proxy stream would otherwise fail the whole build.
+        # The download runs with the caller's GOPROXY, GOPRIVATE,
+        # GONOSUMDB and GOFLAGS untouched. Only the download repeats;
+        # go build below runs once, so a compile error fails at once
+        case "${MODULE_DOWNLOAD_ATTEMPTS}" in
+          [1-9]|10) ;;
+          *)
+            echo "Error: invalid module_download_attempts ❌"
+            exit 1 ;;
+        esac
+        # go env applies GOFLAGS too, and go build ignores the go env
+        # flags there: -json would turn each value below into a JSON
+        # object, -u or -w would turn each read into a write and fail,
+        # and -changed (go 1.23) would print nothing for a default
+        # value. Each read turns them off, leaving GOFLAGS unchanged
+        # for the download and the build. A toolchain before go 1.23
+        # rejects -changed=false, but also ignores -changed in GOFLAGS,
+        # so it is passed only where go env accepts it
+        env_reset=(-json=false -u=false -w=false)
+        if go env "${env_reset[@]}" -changed=false GOVERSION \
+          > /dev/null 2>&1; then
+          env_reset+=(-changed=false)
+        fi
+        if ! gowork="$(go env "${env_reset[@]}" GOWORK)" ||
+          ! gomod="$(go env "${env_reset[@]}" GOMOD)"; then
+          echo "Error: go env failed ❌"
+          exit 1
+        fi
+        # Vendored dependencies live beside go.work in workspace mode
+        # and beside go.mod otherwise; a directory without a module
+        # (GOMOD empty or the null device) has nothing to download
+        module_file=""
+        case "${gowork}" in
+          ''|off)
+            case "${gomod}" in
+              ''|/dev/null|NUL) ;;
+              *) module_file="${gomod}" ;;
+            esac ;;
+          *) module_file="${gowork}" ;;
+        esac
+        module_root=""
+        if [ -n "${module_file}" ]; then
+          if ! module_root="$(posix_path "${module_file}")" ||
+            [ -z "${module_root}" ]; then
+            echo "Error: failed to convert module file path ❌"
+            exit 1
+          fi
+          module_root="${module_root%/*}"
+        fi
+        # Forward the build_flags that select or alter the module graph
+        # (-modfile, -overlay) and the cache mode (-modcacherw), so the
+        # download fetches the modules the build will use; go mod
+        # download accepts exactly these build flags. The same scan
+        # records the last -mod and -modfile the build sees, and
+        # whether each was given at all, since an empty value still
+        # replaces an earlier one, and builds the go list arguments:
+        # every build flag but -o and -json, which go list -f rejects
+        download_args=()
+        list_args=()
+        mod_mode=""
+        mod_set=false
+        mod_explicit=false
+        modfile=""
+        modfile_set=false
+        overlay=""
+        overlay_set=false
+        i=0
+        while [ "${i}" -lt "${#args[@]}" ]; do
+          flag="${args[${i}]}"
+          flag_value=()
+          case "${flag}" in
+            --|-|[!-]*)
+              list_args+=("${args[@]:${i}}")
+              break ;;
+          esac
+          if flag_takes_value "${flag}" &&
+            [ $((i + 1)) -lt "${#args[@]}" ]; then
+            i=$((i + 1))
+            flag_value=("${args[${i}]}")
+          fi
+          case "${flag}" in
+            -mod=*|--mod=*) mod_mode="${flag#*=}"; mod_set=true ;;
+            -mod|--mod) mod_mode="${flag_value[*]}"; mod_set=true ;;
+          esac
+          case "${flag}" in
+            -mod=?*|--mod=?*) mod_explicit=true ;;
+            -mod|--mod)
+              [ -z "${flag_value[*]}" ] || mod_explicit=true ;;
+            -modfile=*|--modfile=*)
+              modfile="${flag#*=}"; modfile_set=true ;;
+            -modfile|--modfile)
+              modfile="${flag_value[*]}"; modfile_set=true ;;
+            -overlay=*|--overlay=*)
+              overlay="${flag#*=}"; overlay_set=true ;;
+            -overlay|--overlay)
+              overlay="${flag_value[*]}"; overlay_set=true ;;
+          esac
+          case "${flag}" in
+            -modfile=*|--modfile=*|-overlay=*|--overlay=*|\
+            -modcacherw|--modcacherw|-modcacherw=*|--modcacherw=*)
+              download_args+=("${flag}") ;;
+            -modfile|--modfile|-overlay|--overlay)
+              download_args+=("${flag}" "${flag_value[@]}") ;;
+          esac
+          case "${flag}" in
+            -o|--o|-o=*|--o=*|-json|--json|-json=*|--json=*) ;;
+            *) list_args+=("${flag}" "${flag_value[@]}") ;;
+          esac
+          i=$((i + 1))
+        done
+        # Split GOFLAGS into goflags_list as go does (cmd/internal/
+        # quoted.Split): fields part on spaces, tabs and newlines, and
+        # a field may sit in single or double quotes, kept verbatim.
+        # Nothing is evaluated, so the value needs no allowlist
+        split_goflags() {
+          local s="$1" ws=$' \t\n\r' quote field
+          goflags_list=()
+          while :; do
+            s="${s#"${s%%[!"${ws}"]*}"}"
+            [ -n "${s}" ] || return 0
+            case "${s}" in
+              \"*|\'*)
+                quote="${s:0:1}"
+                s="${s:1}"
+                case "${s}" in
+                  *"${quote}"*) ;;
+                  *) return 1 ;;
+                esac
+                field="${s%%"${quote}"*}"
+                s="${s:$((${#field} + 1))}" ;;
+              *)
+                field="${s%%["${ws}"]*}"
+                s="${s:${#field}}" ;;
+            esac
+            goflags_list+=("${field}")
+          done
+        }
+        if ! goflags="$(go env "${env_reset[@]}" GOFLAGS)"; then
+          echo "Error: go env failed ❌"
+          exit 1
+        fi
+        if ! split_goflags "${goflags}"; then
+          echo "Error: cannot parse GOFLAGS (unterminated quote) ❌"
+          exit 1
+        fi
+        # GOFLAGS entries are each -flag=value; a -mod or -modfile in
+        # build_flags wins over one here, as on go's command line, even
+        # when its value is empty: build_flags '-mod=' clears a
+        # GOFLAGS -mod=vendor rather than falling back to it. go marks
+        # -mod explicit at its first non-empty value, from GOFLAGS or
+        # the command line, and an explicit -mod, even one emptied
+        # later, turns off the automatic vendor mode below. go build
+        # ignores a GOFLAGS -reuse, but go list and go mod download
+        # reject it inside a module, where the download and the go
+        # list queries below always run, so each clears it; only when
+        # GOFLAGS sets it, as a toolchain before go 1.21 does not
+        # define the flag
+        reuse_reset=()
+        for flag in "${goflags_list[@]}"; do
+          case "${flag}" in
+            -reuse=*|--reuse=*) reuse_reset=(-reuse=) ;;
+            -mod=*|--mod=*)
+              [ "${mod_set}" = "true" ] || mod_mode="${flag#*=}"
+              [ -z "${flag#*=}" ] || mod_explicit=true ;;
+            -modfile=*|--modfile=*)
+              [ "${modfile_set}" = "true" ] || modfile="${flag#*=}" ;;
+            -overlay=*|--overlay=*)
+              [ "${overlay_set}" = "true" ] || overlay="${flag#*=}" ;;
+          esac
+        done
+        # go reads go.mod through the overlay, which can supply a
+        # go.mod absent from disk or replace its go directive, while
+        # go env GOMOD and the go directive scan below read the disk.
+        # With an overlay in effect outside workspace mode, take the
+        # main module's directory and go version from go list -m,
+        # which applies it. -mod=mod keeps a vendor tree from failing
+        # the query, and the explicit values override GOFLAGS entries
+        # go list -m rejects. A failed query (no module even through
+        # the overlay) keeps the answer go env gave. go list -m
+        # reports go 1.16 for a go.mod with no go directive, where go
+        # would not pick vendor mode; the action then skips the
+        # download and the build fetches unretried, as it would
+        # without this step, rather than download for a vendor tree
+        overlay_version_set=false
+        overlay_version=""
+        case "${gowork}" in
+          ''|off) in_ws=false ;;
+          *) in_ws=true ;;
+        esac
+        main_template='{{if .Main}}{{.GoMod}}{{"\n"}}{{.Dir}}'
+        main_template+='{{"\n"}}{{.GoVersion}}{{end}}'
+        if [ -n "${overlay}" ] && [ "${in_ws}" = "false" ] &&
+          main_module="$(go list -m -json=false -mod=mod -e=false \
+            -u=false -versions=false -retracted=false -deps=false \
+            -find=false -test=false -export=false -compiled=false \
+            "${reuse_reset[@]}" -f "${main_template}" \
+            "${download_args[@]}" 2> /dev/null)" &&
+          [ -n "${main_module}" ]; then
+          # read reports end of input for an empty last line
+          {
+            read -r module_file
+            read -r module_root
+            read -r overlay_version || true
+          } <<< "${main_module}"
+          overlay_version_set=true
+          if ! module_root="$(posix_path "${module_root}")" ||
+            [ -z "${module_file}" ] || [ -z "${module_root}" ]; then
+            echo "Error: failed to read the overlaid main module ❌"
+            exit 1
+          fi
+        fi
+        # Find the module mode the build will use, as go does: without
+        # an explicit -mod, a vendor directory beside go.mod (or
+        # go.work) selects vendor mode when the go directive (of the
+        # -modfile, if any, as the overlay presents it) is 1.14 or
+        # later and modules.txt was made in the same (workspace or
+        # module) mode. Only vendor mode can skip the download:
+        # vendor/modules.txt alone does not mean go reads the vendor
+        # directory
+        if [ "${mod_explicit}" != "true" ] && [ -n "${module_root}" ]; then
+          mod_mode="readonly"
+          if [ -d "${module_root}/vendor" ]; then
+            if [ "${overlay_version_set}" = "true" ]; then
+              go_directive="${overlay_version}"
+            else
+              version_file="${module_file}"
+              if [ "${in_ws}" = "false" ] && [ -n "${modfile}" ]; then
+                version_file="${modfile}"
+              fi
+              if ! version_file="$(posix_path "${version_file}")" ||
+                [ -z "${version_file}" ]; then
+                echo "Error: failed to convert module file path ❌"
+                exit 1
+              fi
+              go_directive="$(awk '$1 == "go" { print $2; exit }' \
+                "${version_file}" 2> /dev/null | tr -d '\r')" || true
+            fi
+            go_major="${go_directive%%.*}"
+            go_minor="${go_directive#*.}"
+            go_minor="${go_minor%%[!0-9]*}"
+            vendor_ws=false
+            if [ -f "${module_root}/vendor/modules.txt" ]; then
+              first_line="$(head -n 1 \
+                "${module_root}/vendor/modules.txt" | tr -d '\r')"
+              case "${first_line}" in
+                "## "*)
+                  IFS=';' read -r -a annotations <<< "${first_line#\#\# }"
+                  for entry in "${annotations[@]}"; do
+                    read -r entry <<< "${entry}"
+                    [ "${entry}" != "workspace" ] || vendor_ws=true
+                  done ;;
+              esac
+            fi
+            case "${go_major}" in
+              ''|*[!0-9]*) ;;
+              *)
+                if [ -n "${go_minor}" ] &&
+                  { [ "${go_major}" -gt 1 ] ||
+                    { [ "${go_major}" -eq 1 ] &&
+                      [ "${go_minor}" -ge 14 ]; }; } &&
+                  [ "${vendor_ws}" = "${in_ws}" ]; then
+                  mod_mode="vendor"
+                fi ;;
+            esac
+          fi
+        fi
+        # With -mod=mod the build also resolves imports go.mod lacks,
+        # which go mod download never fetches; go list resolves them
+        # here, inside the retry, with the build's own flags and
+        # targets. -e stops a broken package in a main module (a
+        # source error no retry can fix) from failing go list, and
+        # the template prints only the packages that failed outside
+        # the main modules with no module directory on disk, as a
+        # failed module fetch leaves them; only those are retried. A
+        # package in a module already in the module cache has its
+        # source on disk, so its error (two package names in one
+        # directory, say) is a source error, not a fetch failure, and
+        # reaches go build. An import no module provides then fails
+        # here, as a download failure, while a source error reaches
+        # go build and fails there at once. A build_target of .go
+        # files makes go list report them as one command-line-arguments
+        # package with no module; that is local source too, so its own
+        # error is not retried, while its unresolved imports still are.
+        # A module replaced by a local directory (a replacement with no
+        # version) is local source as well: go mod download skips it,
+        # so its own package errors are source errors and reach go
+        # build, while the imports it fails to resolve are listed as
+        # packages of their own and still retried.
+        # go build ignores GOFLAGS entries it does not define, but go
+        # list applies its own: -json conflicts with -f, -find with
+        # -deps, -m lists modules, -u and -versions need -m, and
+        # -retracted, -test, -export and -compiled change what is
+        # fetched, listed or built. The explicit values below override
+        # any such entry from GOFLAGS
+        list_template='{{if .Error}}{{if not .Standard}}'
+        list_template+='{{if ne .ImportPath "command-line-arguments"}}'
+        list_template+='{{with .Module}}{{if not .Main}}{{if not .Dir}}'
+        list_template+='{{with .Replace}}{{if .Version}}'
+        list_template+='{{$.ImportPath}}{{"\n"}}{{end}}'
+        list_template+='{{else}}{{$.ImportPath}}{{"\n"}}{{end}}'
+        list_template+='{{end}}{{end}}'
+        list_template+='{{else}}{{.ImportPath}}{{"\n"}}{{end}}'
+        list_template+='{{end}}{{end}}{{end}}'
+        fetch_modules() {
+          local unresolved
+          go mod download "${reuse_reset[@]}" "${download_args[@]}" ||
+            return 1
+          [ "${mod_mode}" = "mod" ] || return 0
+          unresolved="$(go list -e -deps -json=false -find=false \
+            -m=false -u=false -versions=false -retracted=false \
+            -test=false -export=false -compiled=false \
+            "${reuse_reset[@]}" -f "${list_template}" \
+            "${list_args[@]}" "${targets[@]}")" || return 1
+          if [ -n "${unresolved}" ]; then
+            echo "Packages outside the main modules failed to load:"
+            printf '%s\n' "${unresolved}"
+            return 1
+          fi
+        }
+        download_attempt=0
+        if [ -z "${module_file}" ]; then
+          download_outcome="skipped"
+          echo "No go.mod or go.work found; skipping module download"
+        elif [ "${mod_mode}" = "vendor" ]; then
+          download_outcome="skipped"
+          echo "Vendor mode in effect; skipping module download"
+        else
+          download_outcome="failure"
+          while [ "${download_attempt}" -lt "${MODULE_DOWNLOAD_ATTEMPTS}" ]
+          do
+            download_attempt=$((download_attempt + 1))
+            if fetch_modules; then
+              download_outcome="success"
+              break
+            fi
+            echo "::warning::module download failed" \
+              "(attempt ${download_attempt} of ${MODULE_DOWNLOAD_ATTEMPTS})"
+            if [ "${download_attempt}" -lt "${MODULE_DOWNLOAD_ATTEMPTS}" ]
+            then
+              # Back off 5 seconds after the first failure and 15
+              # after each later one
+              if [ "${download_attempt}" -eq 1 ]; then
+                delay=5
+              else
+                delay=15
+              fi
+              echo "Retrying go mod download in ${delay} seconds"
+              sleep "${delay}"
+            fi
+          done
+        fi
+        # Emit before any exit so callers can tell a download failure
+        # from a build failure
+        {
+          echo "module_download_outcome=${download_outcome}"
+          echo "module_download_attempts_used=${download_attempt}"
+        } >> "$GITHUB_OUTPUT"
+        if [ "${download_outcome}" = "failure" ]; then
+          echo "Error: module download failed after" \
+            "${download_attempt} attempt(s) ❌"
+          exit 1
+        fi
+        if [ "${download_outcome}" = "success" ]; then
+          # Every module the build needs, including imports -mod=mod
+          # resolved above, is now in the module cache, so build
+          # offline: a fetch the download missed then fails loudly
+          # here instead of reaching the proxy outside the retry.
+          # No -mod=readonly is needed: it is already the module-mode
+          # default, and setting -mod through GOFLAGS would override
+          # the caller's own -mod choice.
+          # GONOPROXY (which defaults to GOPRIVATE) sends matching
+          # modules straight to their VCS even with GOPROXY=off, so
+          # GONOPROXY=none closes that route for the build alone
+          export GOPROXY=off GONOPROXY=none
+        fi
         if [ -n "${OUTPUT_NAME}" ]; then
           binary_path="${PROJECT_DIR}/${OUTPUT_NAME}"
           if ! go build -o "${binary_path}" "${args[@]}" \
@@ -622,7 +1126,7 @@ runs:
             exit 1
           fi
         fi
-        go_version_used="$(go env GOVERSION)"
+        go_version_used="$(go env "${env_reset[@]}" GOVERSION)"
         go_version_used="${go_version_used#go}"
         case "${go_version_used}" in
           *[!0-9A-Za-z.-]*|'')
@@ -669,6 +1173,8 @@ runs:
             echo "**Platform:** native"
           fi
           echo "**CGO Enabled:** ${CGO_ENABLED}"
+          echo "**Module Download:** ${download_outcome}" \
+            "(${download_attempt} attempt(s))"
           if [ -n "${OUTPUT_NAME}" ]; then
             echo "**Binary:** ${OUTPUT_NAME}"
           fi
