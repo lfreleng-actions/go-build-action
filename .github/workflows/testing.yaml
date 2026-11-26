@@ -509,6 +509,16 @@ jobs:
         with:
           build_target: '-x'
 
+      # Outcome only: scripts/tests/test-validate-attempts.sh checks
+      # that the Validate inputs step itself rejects the count
+      - &failures-bad-attempts
+        name: "Running local action with out-of-range attempts"
+        id: bad-attempts
+        continue-on-error: true
+        uses: $/
+        with:
+          module_download_attempts: '11'
+
       - &failures-verify
         name: "Verify invalid inputs were rejected"
         shell: bash
@@ -528,6 +538,7 @@ jobs:
           BOOL_OUTCOME: ${{ steps.bad-bool.outcome }}
           UPLOAD_OUTCOME: ${{ steps.upload-no-output.outcome }}
           TARGET_OUTCOME: ${{ steps.bad-target.outcome }}
+          ATTEMPTS_OUTCOME: ${{ steps.bad-attempts.outcome }}
         run: |
           # Failure testing is also important; all steps MUST fail
           errors=0
@@ -546,7 +557,8 @@ jobs:
             "output:${OUTPUT_OUTCOME}" \
             "bool:${BOOL_OUTCOME}" \
             "upload:${UPLOAD_OUTCOME}" \
-            "target:${TARGET_OUTCOME}"; do
+            "target:${TARGET_OUTCOME}" \
+            "attempts:${ATTEMPTS_OUTCOME}"; do
             test_name="${outcome_pair%%:*}"
             outcome="${outcome_pair#*:}"
             if [ "${outcome}" = "success" ]; then
@@ -594,4 +606,77 @@ jobs:
       - *failures-bad-bool
       - *failures-upload-no-output
       - *failures-bad-target
+      - *failures-bad-attempts
       - *failures-verify
+
+  ### Test the build retry script without network access ###
+  test-retry-script:
+    name: "Test: build retry script (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # Egress blocking supports Linux runners only, so this job
+      # runs on Linux and its steps after these two are aliased
+      # by a separate macOS and Windows job.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@65ff87957e1cac2de3203a85dbb07c31810321cb  # v0.16.4
+        with:
+          config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d' # v0.19.0
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - &retry-checkout
+        name: "Checkout action repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - &retry-run
+        name: "Run retry script tests"
+        shell: bash
+        run: |
+          # Run retry script tests
+          bash scripts/tests/test-retry-go-build.sh
+
+      # The bad-attempts case in test-failures shows only that the
+      # action fails; this runs the Validate inputs step alone on a
+      # valid fixture and checks the attempt-count diagnostic
+      - &retry-validate
+        name: "Run attempt-count validation tests"
+        shell: bash
+        run: |
+          # Run attempt-count validation tests
+          bash scripts/tests/test-validate-attempts.sh
+
+  # The test-retry-script steps on macOS and Windows, without
+  # harden-runner, for the reason given on test-synthetic-unhardened
+  test-retry-script-unhardened:
+    name: "Test: build retry script (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - *retry-checkout
+      - *retry-run
+      - *retry-validate
