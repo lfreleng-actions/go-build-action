@@ -70,20 +70,21 @@ distribution endpoints and, for module downloads during the build, to
 
 <!-- markdownlint-disable MD013 -->
 
-| Name            | Required | Default     | Description                                                                       |
-| --------------- | -------- | ----------- | --------------------------------------------------------------------------------- |
-| go_version      | False    | `''`        | Explicit Go version to install; takes precedence over go_version_file             |
-| go_version_file | False    | `go.mod`    | File to read the Go version from, relative to path_prefix; must resolve within it |
-| path_prefix     | False    | `.`         | Project directory; must resolve within the workspace                              |
-| build_flags     | False    | `''`        | Extra `go build` flags (restricted character set)                                 |
-| goos            | False    | `''`        | Target operating system (GOOS); requires goarch                                   |
-| goarch          | False    | `''`        | Target architecture (GOARCH); requires goos                                       |
-| cgo_enabled     | False    | `0`         | CGO_ENABLED value for the build: `0` or `1`                                       |
-| ldflags         | False    | `''`        | Linker flags passed via `-ldflags` (restricted character set)                     |
-| output_name     | False    | `''`        | Binary filename to build (restricted character set)                               |
-| build_target    | False    | `./...`     | Space-separated package pattern(s) to build                                       |
-| artifact_upload | False    | `false`     | Upload the built binary as an artifact; requires output_name                      |
-| artifact_name   | False    | `go-binary` | Artifact name (restricted character set)                                          |
+| Name                     | Required | Default     | Description                                                                                        |
+| ------------------------ | -------- | ----------- | -------------------------------------------------------------------------------------------------- |
+| go_version               | False    | `''`        | Explicit Go version to install; takes precedence over go_version_file                              |
+| go_version_file          | False    | `go.mod`    | File to read the Go version from, relative to path_prefix; must resolve within it                  |
+| path_prefix              | False    | `.`         | Project directory; must resolve within the workspace                                               |
+| build_flags              | False    | `''`        | Extra `go build` flags (restricted character set)                                                  |
+| goos                     | False    | `''`        | Target operating system (GOOS); requires goarch                                                    |
+| goarch                   | False    | `''`        | Target architecture (GOARCH); requires goos                                                        |
+| cgo_enabled              | False    | `0`         | CGO_ENABLED value for the build: `0` or `1`                                                        |
+| ldflags                  | False    | `''`        | Linker flags passed via `-ldflags` (restricted character set)                                      |
+| output_name              | False    | `''`        | Binary filename to build (restricted character set)                                                |
+| build_target             | False    | `./...`     | Space-separated package pattern(s) to build                                                        |
+| artifact_upload          | False    | `false`     | Upload the built binary as an artifact; requires output_name                                       |
+| artifact_name            | False    | `go-binary` | Artifact name (restricted character set)                                                           |
+| module_download_attempts | False    | `3`         | Total `go build` attempts, from 1 to 10; `1` disables retries; see [Build Retries](#build-retries) |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -166,13 +167,31 @@ steps:
 
 <!-- markdownlint-enable MD046 -->
 
+## Build Retries
+
+With module caching off, `go build` fetches modules from the proxy
+on every run, and one dropped connection would fail the build. When
+a build fails, the action looks for a known transient network error
+in that attempt's output: `stream error:`, `INTERNAL_ERROR`,
+`connection reset by peer`, `i/o timeout`, `TLS handshake timeout`,
+`unexpected EOF`, `502 Bad Gateway`, `503 Service Unavailable` or
+`504 Gateway Timeout`. If it finds one and attempts remain, it logs a
+warning, waits (5 seconds, then 15, then 30 for any later attempt)
+and runs the same command again, up to `module_download_attempts`
+attempts in total.
+
+A failure without one of these markers, such as a compile error,
+fails at once with no retry. Every attempt runs the same command in
+the same directory with the same environment; a retry never turns a
+failure into a pass.
+
 ## Implementation Details
 
 <!-- markdownlint-disable MD013 -->
 
 1. **Input Validation**: Validates booleans, flag character allowlists, the GOOS/GOARCH pair, filenames and path boundaries before use
 2. **Toolchain Setup**: Installs Go via the pinned `actions/setup-go` with `cache: false` (organisation security stance on cache poisoning)
-3. **Build**: Runs `go build` in the project directory, with `-o` when the caller names a binary, exporting GOOS/GOARCH/CGO_ENABLED for cross-compilation
+3. **Build**: Runs `go build` in the project directory, with `-o` when the caller names a binary, exporting GOOS/GOARCH/CGO_ENABLED for cross-compilation; `scripts/retry-go-build.sh` retries the build on transient network errors
 4. **Outputs and Summary**: Emits the binary path and toolchain version, plus a step summary; the optional artifact upload uses the pinned `actions/upload-artifact`
 
 <!-- markdownlint-enable MD013 -->

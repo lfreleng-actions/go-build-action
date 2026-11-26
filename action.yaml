@@ -70,6 +70,11 @@ inputs:
     description: "Artifact name; allowed characters: A-Z a-z 0-9 . _ -"
     required: false
     default: "go-binary"
+  module_download_attempts:
+    # yamllint disable-line rule:line-length
+    description: "Total go build attempts, from 1 to 10; a failed attempt is retried only when its output shows a transient network error; '1' disables retries"
+    required: false
+    default: "3"
 
 outputs:
   binary_path:
@@ -98,6 +103,8 @@ runs:
         INPUT_BUILD_TARGET: ${{ inputs.build_target }}
         INPUT_ARTIFACT_UPLOAD: ${{ inputs.artifact_upload }}
         INPUT_ARTIFACT_NAME: ${{ inputs.artifact_name }}
+        # yamllint disable-line rule:line-length
+        INPUT_MODULE_DOWNLOAD_ATTEMPTS: ${{ inputs.module_download_attempts }}
       run: |
         # Validate inputs
         # Probe for GNU coreutils realpath: it supports -m, while the
@@ -219,6 +226,15 @@ runs:
           0|1) ;;
           *)
             echo "Error: cgo_enabled must be '0' or '1' ❌"
+            exit 1 ;;
+        esac
+        # A whole-string match rejects signs, leading zeros, spaces
+        # and embedded newlines
+        case "${INPUT_MODULE_DOWNLOAD_ATTEMPTS}" in
+          [1-9]|10) ;;
+          *)
+            echo "Error: invalid module_download_attempts ❌"
+            echo "Expected an integer from 1 to 10"
             exit 1 ;;
         esac
         # A case glob validates the entire string, including embedded
@@ -459,6 +475,7 @@ runs:
         GOOS: ${{ inputs.goos }}
         GOARCH: ${{ inputs.goarch }}
         CGO_ENABLED: ${{ inputs.cgo_enabled }}
+        MODULE_DOWNLOAD_ATTEMPTS: ${{ inputs.module_download_attempts }}
       run: |
         # Build project
         # Anchor relative paths to GITHUB_WORKSPACE so behaviour stays
@@ -605,19 +622,23 @@ runs:
           args+=(-ldflags "${LDFLAGS}")
         fi
         read -r -a targets <<< "${BUILD_TARGET}"
+        # Retry the unchanged build command only on transient network
+        # errors in its output; see scripts/retry-go-build.sh
+        retry_build="${GITHUB_ACTION_PATH:?}/scripts/retry-go-build.sh"
         if ! cd "${PROJECT_DIR}"; then
           echo "Error: cannot change to project directory ❌"
           exit 1
         fi
         if [ -n "${OUTPUT_NAME}" ]; then
           binary_path="${PROJECT_DIR}/${OUTPUT_NAME}"
-          if ! go build -o "${binary_path}" "${args[@]}" \
-            "${targets[@]}"; then
+          if ! bash "${retry_build}" go build -o "${binary_path}" \
+            "${args[@]}" "${targets[@]}"; then
             echo "Error: go build failed ❌"
             exit 1
           fi
         else
-          if ! go build "${args[@]}" "${targets[@]}"; then
+          if ! bash "${retry_build}" go build "${args[@]}" \
+            "${targets[@]}"; then
             echo "Error: go build failed ❌"
             exit 1
           fi
